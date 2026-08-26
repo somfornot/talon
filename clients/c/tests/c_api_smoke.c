@@ -50,7 +50,7 @@ int talon_c_api_smoke_test(void) {
         return 4;
     }
 
-    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 1,
+    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 1, NULL, NULL,
                          capture_zero_length_read, NULL, &request_id) !=
         TALON_STATUS_INVALID_ARGUMENT) {
         talon_client_free(client);
@@ -64,7 +64,7 @@ int talon_c_api_smoke_test(void) {
 
     atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
     atomic_store_explicit(&callback_ok, 0, memory_order_relaxed);
-    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0,
+    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0, NULL, NULL,
                          capture_zero_length_read, NULL, &request_id) != TALON_STATUS_OK ||
         request_id != 1) {
         talon_client_free(client);

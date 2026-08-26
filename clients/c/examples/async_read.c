@@ -47,12 +47,15 @@ int main(void) {
     pthread_cond_init(&ctx->cond, NULL);
 
     uint64_t request_id = 0;
+    /* version = NULL, object_size = NULL → the SDK resolves both with a stat. */
     int status = talon_read_async(
         client,
         "s3://bucket/path/object.bin",
         0,
         ctx->buffer,
         4096,
+        NULL,
+        NULL,
         on_read,
         ctx,
         &request_id);

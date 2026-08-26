@@ -95,8 +95,13 @@ static int check_bytes(const uint8_t *got, size_t got_len, uint64_t start,
     return same;
 }
 
+/*
+ * A NULL version or object_size takes the stat-then-read path; passing both
+ * takes the fast path that skips StatObject.
+ */
 static int do_read(talon_client *client, const char *uri, uint64_t offset,
-                   size_t len, op_context *ctx, const char *name) {
+                   size_t len, const char *version, const uint64_t *object_size,
+                   op_context *ctx, const char *name) {
     memset(ctx, 0, sizeof(*ctx));
     ctx->buffer_len = len;
     /* Zero-length reads may pass NULL for dst (talon.h). */
@@ -109,8 +114,8 @@ static int do_read(talon_client *client, const char *uri, uint64_t offset,
     }
 
     uint64_t request_id = 0;
-    int rc = talon_read_async(client, uri, offset, ctx->buffer, len, on_result, ctx,
-                              &request_id);
+    int rc = talon_read_async(client, uri, offset, ctx->buffer, len, version,
+                              object_size, on_result, ctx, &request_id);
     if (rc != TALON_STATUS_OK) {
         fprintf(stderr, "  FAIL %s: submit failed: %s\n", name, talon_last_error());
         pthread_cond_destroy(&ctx->cond);
@@ -166,8 +171,8 @@ static int do_bad_uri(talon_client *client, op_context *ctx) {
     pthread_cond_init(&ctx->cond, NULL);
     uint8_t byte;
     uint64_t request_id = 0;
-    int rc = talon_read_async(client, "ftp://bucket/key", 0, &byte, 1, on_result, ctx,
-                              &request_id);
+    int rc = talon_read_async(client, "ftp://bucket/key", 0, &byte, 1, NULL, 0,
+                              on_result, ctx, &request_id);
     int ok = rc != TALON_STATUS_OK;
     if (!ok) {
         fprintf(stderr, "  FAIL bad-uri: submit unexpectedly succeeded\n");
@@ -204,27 +209,36 @@ int main(int argc, char **argv) {
     ok = do_stat(client, uri, &ctx);
     printf("  %s stat returns size and version\n", ok ? "ok" : "FAIL");
     ok ? passed++ : failed++;
+    /* Reuse the version + size from the stat above for the fast-path read. */
+    char stat_version[64];
+    snprintf(stat_version, sizeof(stat_version), "%s", ctx.version);
+    uint64_t stat_size = ctx.object_size;
 
-    ok = do_read(client, uri, 0, 4096, &ctx, "reads exact bytes at offset 0");
+    ok = do_read(client, uri, 0, 4096, NULL, NULL, &ctx, "reads exact bytes at offset 0");
     printf("  %s reads exact bytes at offset 0\n", ok ? "ok" : "FAIL");
     ok ? passed++ : failed++;
 
-    ok = do_read(client, uri, 1000, 8192, &ctx, "reads exact bytes at offset 1000");
+    ok = do_read(client, uri, 1000, 8192, NULL, NULL, &ctx, "reads exact bytes at offset 1000");
     printf("  %s reads exact bytes at offset 1000\n", ok ? "ok" : "FAIL");
     ok ? passed++ : failed++;
 
-    ok = do_read(client, uri, 0, (size_t)(block_size + (4u << 20)), &ctx,
+    ok = do_read(client, uri, 0, (size_t)(block_size + (4u << 20)), NULL, NULL, &ctx,
                  "reassembles a range spanning block boundaries");
     printf("  %s reassembles a range spanning block boundaries\n", ok ? "ok" : "FAIL");
     ok ? passed++ : failed++;
 
-    ok = do_read(client, uri, block_size - 2048, 4096, &ctx,
+    ok = do_read(client, uri, block_size - 2048, 4096, NULL, NULL, &ctx,
                  "reads across exactly one block edge");
     printf("  %s reads across exactly one block edge\n", ok ? "ok" : "FAIL");
     ok ? passed++ : failed++;
 
-    ok = do_read(client, uri, 0, 0, &ctx, "zero-length read returns empty");
+    ok = do_read(client, uri, 0, 0, NULL, NULL, &ctx, "zero-length read returns empty");
     printf("  %s zero-length read returns empty\n", ok ? "ok" : "FAIL");
+    ok ? passed++ : failed++;
+
+    ok = do_read(client, uri, 1000, (size_t)(block_size + (4u << 20)), stat_version,
+                 &stat_size, &ctx, "fast-path read with a caller-supplied version");
+    printf("  %s fast-path read with a caller-supplied version\n", ok ? "ok" : "FAIL");
     ok ? passed++ : failed++;
 
     ok = do_bad_uri(client, &ctx);

@@ -13,8 +13,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use talon_cache_client::block_reader::FileView;
-use talon_cache_client::{BlockReader, CoordinatorClient, PlacementCache};
+use talon_cache_client::{plan_read, BlockReader, CoordinatorClient, PlacementCache};
 use talon_core::{ObjectId, Version};
 
 const DEFAULT_BLOCK_SIZE: u32 = 256 << 20;
@@ -260,6 +259,23 @@ pub unsafe extern "C" fn talon_client_free(client: *mut TalonClient) {
 }
 
 /// Submit an async read.
+///
+/// `version` and `object_size` are each optional and independently nullable;
+/// NULL means "the caller does not have this value". The read takes the fast
+/// path that skips the `StatObject` round trip **only when both are non-NULL** —
+/// then it reads under the caller-supplied version and size, and the caller owns
+/// keeping them current for the object generation being read. If either is NULL
+/// the SDK resolves both with a `StatObject` first (the historical behavior) and
+/// any lone value that was supplied is ignored, since a stat is authoritative
+/// for both and a read cannot skip it without both halves.
+///
+/// When taken, `*object_size` is the object's total byte length and bounds the
+/// read at EOF (a POSIX short read): a value smaller than `offset + dst_len`
+/// yields a short read, `0` denotes a genuinely empty object (an unambiguous
+/// zero-byte read), and a value larger than the object surfaces as a read error
+/// rather than fabricated bytes. A caller that has no valid size passes NULL.
+///
+/// Blocks spanned by the read are fetched concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn talon_read_async(
     client: *mut TalonClient,
@@ -267,6 +283,8 @@ pub unsafe extern "C" fn talon_read_async(
     offset: u64,
     dst: *mut u8,
     dst_len: usize,
+    version: *const c_char,
+    object_size: *const u64,
     callback: Option<TalonCallback>,
     user_data: *mut c_void,
     request_id_out: *mut u64,
@@ -291,6 +309,18 @@ pub unsafe extern "C" fn talon_read_async(
 
         let uri = c_string(uri, "uri")?;
         let object = parse_uri(&uri)?;
+        // A read skips StatObject only when the caller supplies both halves of
+        // the object's identity; a NULL in either means "resolve it".
+        let known_version = if version.is_null() {
+            None
+        } else {
+            Some(c_string(version, "version")?)
+        };
+        let known_size = if object_size.is_null() {
+            None
+        } else {
+            Some(unsafe { *object_size })
+        };
         let request_id = inner.next_request_id.fetch_add(1, Ordering::Relaxed);
         unsafe {
             *request_id_out = request_id;
@@ -311,22 +341,26 @@ pub unsafe extern "C" fn talon_read_async(
                 if read_buffer.len == 0 {
                     return Ok(0);
                 }
-                let stat = coordinator
-                    .stat_object(&object)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let version = Version::new(stat.version.as_str());
-                let file = FileView {
-                    object: &object,
-                    block_size,
-                    version: &version,
-                    size: stat.size,
+                let (version, size) = match (known_version, known_size) {
+                    (Some(version), Some(size)) => (Version::new(version.as_str()), size),
+                    _ => {
+                        let stat = coordinator
+                            .stat_object(&object)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        (Version::new(stat.version.as_str()), stat.size)
+                    }
                 };
                 let dst = unsafe { read_buffer.into_mut_slice() };
-                reader
-                    .read_into(&file, offset, dst, now_ms())
-                    .await
-                    .map_err(|error| error.to_string())
+                let plan = plan_read(
+                    &object,
+                    offset,
+                    dst.len() as u64,
+                    block_size,
+                    &version,
+                    size,
+                );
+                fetch_blocks_concurrent(reader, plan, dst, now_ms()).await
             }
             .await;
             dispatch_result(
@@ -338,6 +372,60 @@ pub unsafe extern "C" fn talon_read_async(
         });
         Ok(())
     })
+}
+
+/// Fetch every segment of `plan` concurrently into `dst`, rather than walking
+/// the blocks in series.
+///
+/// [`plan_read`] partitions the requested range into disjoint per-block segments
+/// (already clamped at EOF); each segment is handed an exclusive sub-slice of
+/// `dst`, and every block is fetched in parallel on the runtime. The segments
+/// cover `[0, planned_len)` in order and every task is joined before this future
+/// resolves; the caller owns `dst` until the callback runs (the header
+/// contract), so lending each task a disjoint `'static` sub-slice is sound.
+async fn fetch_blocks_concurrent(
+    reader: BlockReader,
+    plan: Vec<talon_cache_client::BlockSegment>,
+    dst: &'static mut [u8],
+    now_ms: u64,
+) -> Result<usize, String> {
+    if plan.is_empty() {
+        return Ok(0);
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut rest = dst;
+    for segment in plan {
+        let want = segment.len as usize;
+        let (chunk, tail) = split_static_prefix(rest, want);
+        rest = tail;
+        let reader = reader.clone();
+        tasks.spawn(async move {
+            reader
+                .read_block_into(&segment.block, segment.offset_in_block, chunk, now_ms)
+                .await
+                .map_err(|error| error.to_string())
+                .map(|read| (read, want))
+        });
+    }
+
+    let mut written = 0usize;
+    while let Some(joined) = tasks.join_next().await {
+        let (read, want) = joined.map_err(|error| format!("block read task failed: {error}"))??;
+        if read != want {
+            return Err(format!(
+                "worker returned {read} of {want} requested bytes; the object may have changed"
+            ));
+        }
+        written += read;
+    }
+    Ok(written)
+}
+
+/// Split a `'static` buffer into an owned `'static` prefix of `n` bytes and the
+/// `'static` remainder, so each concurrent block fetch can own its slice.
+fn split_static_prefix(buf: &'static mut [u8], n: usize) -> (&'static mut [u8], &'static mut [u8]) {
+    buf.split_at_mut(n)
 }
 
 /// Submit an async stat.
@@ -775,6 +863,15 @@ mod tests {
     }
 
     async fn mock_coordinator(worker_addr: String) -> String {
+        mock_coordinator_counting(worker_addr, Arc::new(AtomicUsize::new(0))).await
+    }
+
+    /// Like [`mock_coordinator`], but records how many `StatObject` control
+    /// messages it served, so a test can prove the version fast path skips them.
+    async fn mock_coordinator_counting(
+        worker_addr: String,
+        stat_calls: Arc<AtomicUsize>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -784,6 +881,7 @@ mod tests {
                     Err(_) => return,
                 };
                 let worker_addr = worker_addr.clone();
+                let stat_calls = Arc::clone(&stat_calls);
                 tokio::spawn(async move {
                     let mut hdr = [0u8; HEADER_LEN];
                     if sock.read_exact(&mut hdr).await.is_err() {
@@ -796,10 +894,13 @@ mod tests {
                     full.extend_from_slice(&body);
                     let (_header, msg) = talon_transport::decode(&full).unwrap();
                     let reply = match msg {
-                        ControlMessage::StatObject { .. } => ControlMessage::ObjectStat {
-                            size: 8192,
-                            version: "test-version".into(),
-                        },
+                        ControlMessage::StatObject { .. } => {
+                            stat_calls.fetch_add(1, Ordering::SeqCst);
+                            ControlMessage::ObjectStat {
+                                size: 8192,
+                                version: "test-version".into(),
+                            }
+                        }
                         ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
                             nodes: vec![NodeInfo {
                                 id: NodeId::new("worker-a"),
@@ -854,6 +955,24 @@ mod tests {
         (client, coordinator)
     }
 
+    /// Build a client with a caller-chosen block size whose coordinator counts
+    /// the `StatObject` calls it serves.
+    async fn new_client_counting(block_size: u32) -> (*mut TalonClient, Arc<AtomicUsize>) {
+        let worker = mock_worker().await;
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = mock_coordinator_counting(worker, Arc::clone(&stat_calls)).await;
+        let coordinator_c = cstring(&coordinator);
+        let options = TalonClientOptions {
+            block_size,
+            callback_executor: ptr::null(),
+        };
+        let mut client = ptr::null_mut();
+        let status = unsafe { talon_client_new(coordinator_c.as_ptr(), &options, &mut client) };
+        assert_eq!(status, STATUS_OK);
+        assert!(!client.is_null());
+        (client, stat_calls)
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_create_and_free_with_default_options() {
         let (client, _coordinator) = new_client().await;
@@ -895,6 +1014,8 @@ mod tests {
                 100,
                 dst.as_mut_ptr(),
                 dst.len(),
+                ptr::null(),
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -929,6 +1050,8 @@ mod tests {
                 100,
                 ptr::null_mut(),
                 0,
+                ptr::null(),
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -941,6 +1064,205 @@ mod tests {
         assert_eq!(snapshot.request_id, request_id);
         assert_eq!(snapshot.bytes_written, 0);
         assert!(snapshot.error.is_none());
+
+        unsafe {
+            talon_client_free(client);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_with_version_skips_stat() {
+        let (client, stat_calls) = new_client_counting(0).await;
+        let state = CallbackState::new();
+        let uri = cstring("s3://bucket/object.bin");
+        let version = cstring("caller-known-version");
+        let object_size: u64 = 8192;
+        let mut dst = vec![0u8; 4096];
+        let mut request_id = 0u64;
+
+        let status = unsafe {
+            talon_read_async(
+                client,
+                uri.as_ptr(),
+                100,
+                dst.as_mut_ptr(),
+                dst.len(),
+                version.as_ptr(),
+                &object_size,
+                Some(capture_callback),
+                state.user_data(),
+                &mut request_id,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let snapshot = state.wait();
+        assert_eq!(snapshot.status, STATUS_OK);
+        assert_eq!(snapshot.bytes_written, dst.len());
+        let expected: Vec<u8> = (0..dst.len()).map(|j| ((100 + j) % 251) as u8).collect();
+        assert_eq!(dst, expected);
+        assert_eq!(
+            stat_calls.load(Ordering::SeqCst),
+            0,
+            "a caller-supplied version and size must skip the StatObject round trip"
+        );
+        assert!(snapshot.error.is_none());
+
+        unsafe {
+            talon_client_free(client);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_without_version_calls_stat() {
+        let (client, stat_calls) = new_client_counting(0).await;
+        let state = CallbackState::new();
+        let uri = cstring("s3://bucket/object.bin");
+        let mut dst = vec![0u8; 4096];
+        let mut request_id = 0u64;
+
+        let status = unsafe {
+            talon_read_async(
+                client,
+                uri.as_ptr(),
+                100,
+                dst.as_mut_ptr(),
+                dst.len(),
+                ptr::null(),
+                ptr::null(),
+                Some(capture_callback),
+                state.user_data(),
+                &mut request_id,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let snapshot = state.wait();
+        assert_eq!(snapshot.status, STATUS_OK);
+        assert_eq!(
+            stat_calls.load(Ordering::SeqCst),
+            1,
+            "a NULL version must resolve metadata with StatObject"
+        );
+
+        unsafe {
+            talon_client_free(client);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_without_size_falls_back_to_stat() {
+        // A caller that knows the version but has no valid size passes a NULL
+        // object_size; the read must resolve both via StatObject, not guess.
+        let (client, stat_calls) = new_client_counting(0).await;
+        let state = CallbackState::new();
+        let uri = cstring("s3://bucket/object.bin");
+        let version = cstring("caller-known-version");
+        let mut dst = vec![0u8; 4096];
+        let mut request_id = 0u64;
+
+        let status = unsafe {
+            talon_read_async(
+                client,
+                uri.as_ptr(),
+                100,
+                dst.as_mut_ptr(),
+                dst.len(),
+                version.as_ptr(),
+                ptr::null(),
+                Some(capture_callback),
+                state.user_data(),
+                &mut request_id,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let snapshot = state.wait();
+        assert_eq!(snapshot.status, STATUS_OK);
+        assert_eq!(snapshot.bytes_written, dst.len());
+        assert_eq!(
+            stat_calls.load(Ordering::SeqCst),
+            1,
+            "a NULL size must resolve metadata with StatObject even when a version is given"
+        );
+
+        unsafe {
+            talon_client_free(client);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_object_fast_path_reads_zero_without_stat() {
+        // object_size pointing at 0 is a genuinely empty object, distinct from a
+        // NULL "unknown": the read returns zero bytes and still skips the stat.
+        let (client, stat_calls) = new_client_counting(0).await;
+        let state = CallbackState::new();
+        let uri = cstring("s3://bucket/object.bin");
+        let version = cstring("caller-known-version");
+        let object_size: u64 = 0;
+        let mut dst = vec![0u8; 128];
+        let mut request_id = 0u64;
+
+        let status = unsafe {
+            talon_read_async(
+                client,
+                uri.as_ptr(),
+                0,
+                dst.as_mut_ptr(),
+                dst.len(),
+                version.as_ptr(),
+                &object_size,
+                Some(capture_callback),
+                state.user_data(),
+                &mut request_id,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let snapshot = state.wait();
+        assert_eq!(snapshot.status, STATUS_OK);
+        assert_eq!(snapshot.bytes_written, 0);
+        assert_eq!(
+            stat_calls.load(Ordering::SeqCst),
+            0,
+            "a size of 0 is an empty object, not a reason to stat"
+        );
+
+        unsafe {
+            talon_client_free(client);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_block_read_reassembles_concurrent_blocks() {
+        // A 1 KiB block size makes a 4 KiB read span five blocks, so the
+        // concurrent fetches must land in the right disjoint sub-slices.
+        let (client, _stat_calls) = new_client_counting(1024).await;
+        let state = CallbackState::new();
+        let uri = cstring("s3://bucket/object.bin");
+        let version = cstring("caller-known-version");
+        let object_size: u64 = 1 << 20;
+        let mut dst = vec![0u8; 4096];
+        let mut request_id = 0u64;
+
+        let status = unsafe {
+            talon_read_async(
+                client,
+                uri.as_ptr(),
+                100,
+                dst.as_mut_ptr(),
+                dst.len(),
+                version.as_ptr(),
+                &object_size,
+                Some(capture_callback),
+                state.user_data(),
+                &mut request_id,
+            )
+        };
+        assert_eq!(status, STATUS_OK);
+        let snapshot = state.wait();
+        assert_eq!(snapshot.status, STATUS_OK, "error: {:?}", snapshot.error);
+        assert_eq!(snapshot.bytes_written, dst.len());
+        // The mock worker fills each byte with (absolute_offset % 251), so a
+        // correct reassembly reproduces that sequence across every block.
+        let expected: Vec<u8> = (0..dst.len()).map(|j| ((100 + j) % 251) as u8).collect();
+        assert_eq!(dst, expected);
 
         unsafe {
             talon_client_free(client);
@@ -1040,6 +1362,8 @@ mod tests {
                 0,
                 ptr::null_mut(),
                 0,
+                ptr::null(),
+                ptr::null(),
                 Some(capture_callback),
                 ptr::null_mut(),
                 &mut request_id,

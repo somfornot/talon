@@ -67,6 +67,21 @@ void talon_client_free(talon_client *client);
  * [dst, dst + dst_len) is exclusively owned by the SDK until the callback runs:
  * callers must not read, write, free, or reuse overlapping storage for another
  * operation during that interval. A zero-length read may pass NULL for dst.
+ *
+ * version and object_size are each optional and independently nullable; NULL
+ * means the caller does not have that value. The read skips the StatObject round
+ * trip only when BOTH are non-NULL, using the caller-supplied version and size
+ * (the caller owns keeping them current for the object generation being read).
+ * If either is NULL the SDK resolves both with a StatObject first and any lone
+ * value supplied is ignored, since a read cannot skip the stat without both.
+ *
+ * When used, *object_size is the object's total byte length and bounds the read
+ * at EOF (a POSIX short read): a value smaller than offset + dst_len yields a
+ * short read, 0 denotes a genuinely empty object (an unambiguous zero-byte
+ * read), and a value larger than the object surfaces as a read error rather than
+ * fabricated bytes. A caller with no valid size passes NULL.
+ *
+ * Blocks spanned by the read are fetched concurrently.
  */
 int talon_read_async(
     talon_client *client,
@@ -74,6 +89,8 @@ int talon_read_async(
     uint64_t offset,
     uint8_t *dst,
     size_t dst_len,
+    const char *version,
+    const uint64_t *object_size,
     talon_callback callback,
     void *user_data,
     uint64_t *request_id_out);
