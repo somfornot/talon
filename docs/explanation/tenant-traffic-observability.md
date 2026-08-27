@@ -2,11 +2,10 @@
 
 ## Status
 
-Design proposal. Companion to
-[Eventual Global Tenant Rate Limits](eventual-global-tenant-rate-limits.md).
-That document defines how a tenant's aggregate traffic is *bounded*; this one
-defines how operators *see* each tenant's live traffic across the cluster. The
-two share signal sources and the same eventual-consistency envelope.
+Design proposal. Defines how operators *see* each tenant's live traffic across
+the cluster, reusing the same per-`(tenant, metric)` counters the worker's
+local rate limiter (`crates/talon-core/src/rate_limit.rs`) already maintains
+for enforcement — this document only observes; it does not bound traffic.
 
 ## Problem
 
@@ -45,8 +44,9 @@ plane. Clients that connect directly to a worker and bypass the gateway (FUSE
 and the native clients) carry no credential; their traffic is attributed to a
 single reserved **`unattributed`** tenant so that it is still visible and
 bounded rather than silently uncounted. Tenant identity, its propagation, and
-the unattributed fallback are specified by the rate-limit design; this document
-only consumes the resulting `(tenant, metric)` signal.
+the unattributed fallback are implemented in `crates/talon-core/src/tenant.rs`
+(`TenantId::Unattributed`); this document only consumes the resulting
+`(tenant, metric)` signal.
 
 ## Contract
 
@@ -89,10 +89,12 @@ These are cheap reads off counters that already exist for enforcement.
 
 ## Two aggregation tiers
 
-Cluster-wide per-tenant state is assembled from workers in two tiers. Tier 1
-works from day one and is always available; Tier 2 becomes available once the
-rate-limit owner layer exists and supersedes Tier 1 for keys with an active
-owner.
+Cluster-wide per-tenant state is assembled from workers in one tier available
+today, plus a second tier this document records as a natural extension should
+a distributed rate-limit layer ever be built. Tier 1 works from day one and is
+the only tier specified for delivery; Tier 2 is hypothetical and would
+supersede Tier 1 for keys with an active owner, if and when its prerequisite
+exists.
 
 ### Tier 1 — heartbeat top-N summaries (available in the local-only stage)
 
@@ -126,22 +128,24 @@ truncation is surfaced (an `other` aggregate plus a "N tenants omitted" count).
 This costs one small periodic message per worker, scales with workers × N (not
 with IOPS), and adds nothing to the data hot path.
 
-### Tier 2 — owner-authoritative view (with the rate-limit owner layer)
+### Tier 2 — owner-authoritative view (hypothetical; no such layer exists today)
 
-Once `RateKey` owners exist, each owner already holds the *exact* aggregated
-global consumption for its tenant×metric keys — it sums every worker's usage
-reports to maintain the authoritative meter. A management aggregator on the
-coordinator pulls each owner's current per-key meter state (remaining, target
-rate, observed rate, active-reporter count) at the owner snapshot cadence. This
-yields an **exact** cluster-wide per-tenant rate for every key with an active
-owner, at 2–5 ms freshness, and reuses the same consistent-hash ring and
-membership epoch the limiter already computes to know which worker owns which
-key.
+Today's rate limiter is local-only (`crates/talon-core/src/rate_limit.rs`) —
+there is no distributed owner layer, and consequently no Tier 2 to build
+against yet. This section is recorded for whoever eventually designs that
+layer: **if** a distributed limiter elects one logical owner per
+`(tenant, metric)` key — for instance via a consistent-hash ring over worker
+membership, summing every worker's usage reports into an authoritative meter —
+then a management aggregator on the coordinator could pull each owner's
+current per-key meter state (remaining, target rate, observed rate,
+active-reporter count) at the owner's snapshot cadence, yielding an **exact**
+cluster-wide per-tenant rate for every key with an active owner, at
+millisecond freshness.
 
-Tier 2 supersedes Tier 1 for keys that have an active owner; Tier 1 remains the
-fallback for keys with no recent activity and during owner failover, when the
-authoritative meter is briefly unavailable. The exposure layer marks each
-tenant's numbers as `exact` or `approximate` accordingly.
+Such a Tier 2 would supersede Tier 1 for keys that have an active owner; Tier 1
+would remain the fallback for keys with no recent activity and during owner
+failover. The exposure layer's `exact` / `approximate` freshness marker below
+anticipates this distinction but has only one tier to mark today.
 
 ## Exposure
 
@@ -172,7 +176,8 @@ Only aggregate and enum-labeled series are exported — never a raw tenant label
 - cluster totals per metric (`read_iops`, `client_egress_bytes`,
   `origin_read_bytes`);
 - count of currently-throttled tenants;
-- the estimated-excess gauge (the limiter's `N*b + R*d` envelope);
+- an estimated-excess gauge, once a bounded-overshoot enforcement model exists
+  to size it against (see Tier 2);
 - report/snapshot aggregation delay histograms and aggregation staleness.
 
 For the handful of tenants an operator wants on a dashboard, a small
@@ -185,10 +190,11 @@ net-new piece the metrics layer needs, and it keeps the existing
 ### Dashboards and alerts
 
 A cluster dashboard shows per-metric totals, a top-N tenant table (sourced from
-the management API or the allow-listed series), throttle rate, and the excess
-envelope. Alerts cover sustained per-tenant throttling, an excess-envelope
-breach, and aggregation staleness. Dashboard panels obey the banned-label rule;
-no raw tenant identifier appears in a panel except an allow-listed one.
+the management API or the allow-listed series), and throttle rate — plus the
+excess envelope, once Tier 2 exists to define one. Alerts cover sustained
+per-tenant throttling and aggregation staleness. Dashboard panels obey the
+banned-label rule; no raw tenant identifier appears in a panel except an
+allow-listed one.
 
 ## Cardinality and safety
 
@@ -228,8 +234,8 @@ allow-listed tenant series:      operator-configured, small
 - Per-request, per-tenant tracing on the hot path. Hot-path decisions stay as
   counters, consistent with the zero-copy data-plane design.
 - Sub-millisecond global accuracy. The view is bounded-stale by construction.
-- Enforcement. This document only observes; bounding is defined by the
-  rate-limit design.
+- Enforcement. This document only observes; bounding is
+  `crates/talon-core/src/rate_limit.rs`'s concern.
 
 ## Delivery plan
 
@@ -242,15 +248,13 @@ enforcement stage:
    endpoints.
 3. Bounded Prometheus aggregates, the allow-list helper, and the dashboard and
    alerts.
-4. With the owner stage: the Tier 2 owner-authoritative pull, with the API and
-   dashboards preferring exact values when an owner is present.
+4. Only if a distributed rate-limit owner layer is later built: the Tier 2
+   owner-authoritative pull, with the API and dashboards preferring exact
+   values when an owner is present.
 
 ## References
 
-- [Eventual Global Tenant Rate Limits](eventual-global-tenant-rate-limits.md) —
-  the enforcement design and the source of the `(tenant, metric)` signal, the
-  consistent-hash owner ring, and the excess envelope.
-- Distributed Tenant Cache Quotas (the companion cache-capacity design) — its
-  observability section defines the same bounded-label, top-N, and
-  management-API drill-down discipline that this document follows for traffic
-  metrics.
+- [Distributed Tenant Cache Quotas](distributed-tenant-cache-quotas.md) — the
+  companion cache-*capacity* design; its observability section defines the
+  same bounded-label, top-N, and management-API drill-down discipline that
+  this document follows for traffic metrics.
