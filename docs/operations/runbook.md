@@ -73,7 +73,8 @@ Three backends, compared across the aspects that matter for an operator.
 - **Operational owner:** your Kubernetes control plane.
 - **Credentials:** pod ServiceAccount token.
 - **Liveness authority:** Lease `renewTime` + TTL.
-- **Failure mode:** API-server outage → coordinators fail closed.
+- **Failure mode:** API-server outage → coordinators use a bounded recent
+  last-good membership, then fail closed after `unhealthy_after_ms`.
 - **Migration:** ↔ etcd requires a drain + redeploy (records are rebuildable).
 
 ### External etcd
@@ -84,7 +85,8 @@ Three backends, compared across the aspects that matter for an operator.
 - **Operational owner:** your etcd operators.
 - **Credentials:** Secret (user/pass and/or mTLS).
 - **Liveness authority:** etcd lease TTL.
-- **Failure mode:** etcd outage → coordinators fail closed.
+- **Failure mode:** etcd outage → coordinators use a bounded recent last-good
+  membership, then fail closed after `unhealthy_after_ms`.
 - **Migration:** ↔ Kubernetes requires a drain + redeploy (records are rebuildable).
 
 Records in the shared store are **ephemeral and rebuildable** from live process
@@ -157,6 +159,10 @@ Secret; see §1.
   `lease_ttl` (default 30s) after its last accepted heartbeat.
 - **Unhealthy marking**: a node shows `unhealthy` after `unhealthy_after`
   (default 15s) of silence, before removal.
+- **Worker control failure grace**: after at least one successful status
+  heartbeat, a worker retains data-plane readiness through at most three missed
+  heartbeat intervals (capped at 15s); initial registration failure has no
+  grace.
 - **Failover interruption bound**: a client's request that hits a failing
   coordinator retries another via the load-balanced Service; placement stays
   correct because every coordinator derives the same deterministic version from
@@ -223,14 +229,16 @@ unscrapeable for >2m. Its cached blocks are unreachable via that endpoint.
 ### state-store-errors
 
 **Alert:** `TalonStateStoreErrors` (critical) — coordinators are failing shared
-state-store operations. New authoritative reads fail closed.
+state-store operations. A recent reconciled membership remains usable for at
+most `unhealthy_after_ms`; authoritative reads then fail closed.
 
 1. **etcd**: check etcd health/quorum, TLS/cert expiry, and auth. Verify the
    `talon-etcd` Secret endpoints/credentials.
 2. **Kubernetes**: check API-server availability and that the Lease RBAC is
    applied (`kubectl auth can-i --as=system:serviceaccount:talon:talon-coordinator update leases -n talon`).
 3. Coordinators recover automatically once the backend is healthy; readiness and
-   membership resume on the next successful snapshot.
+   membership resume on the next successful reconciliation (a health probe alone
+   does not promote stale membership).
 
 ### cluster-view-stale
 
@@ -302,7 +310,7 @@ coordinators and workers re-register within one heartbeat interval.
 | Endpoint | Auth | Meaning |
 |----------|------|---------|
 | `GET /healthz` | public | process liveness (200 unless shutting down) |
-| `GET /readyz` | public | shared-state reachable (503 fails closed) |
+| `GET /readyz` | public | reconciled membership is still authoritative; transient state-store errors use the bounded grace, then 503 |
 | `GET /metrics` | public | Prometheus exposition |
 | `GET /api/v1/*` | protected | versioned management API (see #82) |
 | `/ui` | protected | management console |

@@ -23,7 +23,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use talon_backend::{
@@ -51,6 +51,13 @@ use tokio::net::{TcpListener, TcpStream};
 
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A worker lease remains valid across an isolated control connection failure.
+/// Keep serving after a prior successful heartbeat for a bounded three-tick
+/// window (capped at 15 seconds) instead of turning one refused connection into
+/// a data-plane outage.
+const CONTROL_FAILURE_GRACE_INTERVALS: u32 = 3;
+const MAX_CONTROL_FAILURE_GRACE: Duration = Duration::from_secs(15);
 
 /// Upper bound on concurrent data-plane connections. Beyond this, new peers wait
 /// for an in-flight connection to finish rather than each spawning an unbounded
@@ -141,7 +148,8 @@ struct Args {
     /// Stable node identity; defaults to the RPC listen address.
     #[arg(long)]
     node_id: Option<String>,
-    /// Control-plane heartbeat interval in milliseconds.
+    /// Control-plane heartbeat interval in milliseconds; readiness tolerates up
+    /// to three missed intervals, capped at 15 seconds.
     #[arg(long)]
     heartbeat_interval_ms: Option<u64>,
     /// Logical block size in bytes.
@@ -768,6 +776,19 @@ where
 }
 
 /// Maintain registration and send legacy plus versioned status heartbeats.
+fn retain_readiness_after_control_failure(
+    observability: &WorkerObservability,
+    last_successful_heartbeat: Option<Instant>,
+    failure_grace: Duration,
+) {
+    let last_success_is_stale = last_successful_heartbeat
+        .map(|last| last.elapsed() >= failure_grace)
+        .unwrap_or(true);
+    if last_success_is_stale {
+        observability.readiness().set_control_registered(false);
+    }
+}
+
 fn spawn_control_plane(
     coordinator: String,
     channel: Option<ControlTlsChannel>,
@@ -780,6 +801,10 @@ fn spawn_control_plane(
         let mut ticker = tokio::time::interval(heartbeat_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut registered = false;
+        let mut last_successful_heartbeat = None;
+        let failure_grace = heartbeat_interval
+            .saturating_mul(CONTROL_FAILURE_GRACE_INTERVALS)
+            .min(MAX_CONTROL_FAILURE_GRACE);
         loop {
             ticker.tick().await;
 
@@ -792,17 +817,31 @@ fn spawn_control_plane(
                 {
                     Ok(Ok(())) => {
                         registered = true;
-                        observability.readiness().set_control_registered(true);
+                        // Preserve the existing first-registration contract so
+                        // the status sent immediately below advertises ready.
+                        // Re-registration after a completed heartbeat does not
+                        // renew the grace; only a full heartbeat cycle does.
+                        if last_successful_heartbeat.is_none() {
+                            observability.readiness().set_control_registered(true);
+                        }
                     }
                     Ok(Err(error)) => {
                         observability.metrics().record_heartbeat_failure();
-                        observability.readiness().set_control_registered(false);
+                        retain_readiness_after_control_failure(
+                            &observability,
+                            last_successful_heartbeat,
+                            failure_grace,
+                        );
                         tracing::warn!(%error, "worker registration failed; retrying");
                         continue;
                     }
                     Err(_) => {
                         observability.metrics().record_heartbeat_failure();
-                        observability.readiness().set_control_registered(false);
+                        retain_readiness_after_control_failure(
+                            &observability,
+                            last_successful_heartbeat,
+                            failure_grace,
+                        );
                         tracing::warn!("worker registration timed out; retrying");
                         continue;
                     }
@@ -822,17 +861,29 @@ fn spawn_control_plane(
             })
             .await;
             match heartbeat {
-                Ok(Ok(())) => observability.metrics().record_heartbeat_success(),
+                Ok(Ok(())) => {
+                    last_successful_heartbeat = Some(Instant::now());
+                    observability.readiness().set_control_registered(true);
+                    observability.metrics().record_heartbeat_success();
+                }
                 Ok(Err(error)) => {
                     registered = false;
                     observability.metrics().record_heartbeat_failure();
-                    observability.readiness().set_control_registered(false);
+                    retain_readiness_after_control_failure(
+                        &observability,
+                        last_successful_heartbeat,
+                        failure_grace,
+                    );
                     tracing::warn!(%error, "control heartbeat failed; registration will retry");
                 }
                 Err(_) => {
                     registered = false;
                     observability.metrics().record_heartbeat_failure();
-                    observability.readiness().set_control_registered(false);
+                    retain_readiness_after_control_failure(
+                        &observability,
+                        last_successful_heartbeat,
+                        failure_grace,
+                    );
                     tracing::warn!("control heartbeat timed out; registration will retry");
                 }
             }
@@ -1227,6 +1278,38 @@ mod tests {
         assert!(!observability.is_ready());
 
         control.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn recent_control_heartbeat_bridges_only_a_bounded_failure_window() {
+        let (_worker, observability, _node, root) = test_worker();
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        observability.readiness().set_control_registered(true);
+        let grace = Duration::from_secs(15);
+
+        retain_readiness_after_control_failure(&observability, Some(Instant::now()), grace);
+        assert!(
+            observability.is_ready(),
+            "one failure after a recent heartbeat must not stop the data plane"
+        );
+
+        let stale = Instant::now()
+            .checked_sub(grace + Duration::from_millis(1))
+            .unwrap();
+        retain_readiness_after_control_failure(&observability, Some(stale), grace);
+        assert!(
+            !observability.is_ready(),
+            "a worker must become unready after the heartbeat grace expires"
+        );
+
+        observability.readiness().set_control_registered(true);
+        retain_readiness_after_control_failure(&observability, None, grace);
+        assert!(
+            !observability.is_ready(),
+            "a worker without any successful heartbeat has no grace"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 

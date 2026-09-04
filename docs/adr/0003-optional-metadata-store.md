@@ -485,9 +485,10 @@ during a TMS or propagation outage. Ordinary reads of unlinked path-addressed
 objects remain available.
 
 This section concerns TMS failure only. Failure of `ClusterStateStore` retains
-ADR 0001 §8's fail-closed behavior for new authoritative membership and
-placement reads. A coordinator must not initiate a write-shard handoff or
-recovery from a stale last-good membership snapshot.
+ADR 0001 §8's bounded last-good grace and subsequent fail-closed behavior for
+new authoritative membership and placement reads. That availability grace is
+for read routing only: a coordinator must not initiate a write-shard handoff or
+recovery from a snapshot known to be last-good after a failed refresh.
 
 **Write-back namespaces are the deliberate exception.** Before a dirty object
 is flushed, the object store contains an older version. A read that bypasses

@@ -260,22 +260,33 @@ value). Once all coordinators run the new code, two of them observing the same
 membership emit the identical token and the spurious refreshes stop. No operator
 action or flag day is required.
 
-### 8. Backend failure is fail-closed for new authoritative reads
+### 8. Backend failure has bounded last-good grace, then fails closed
 
 If a coordinator cannot obtain a snapshot within its configured timeout:
 
-- readiness becomes false;
-- registration and heartbeat return an explicit retryable failure;
-- new membership and placement lookups fail instead of claiming stale state is
-  current;
-- the management API returns `503 Service Unavailable`;
+- the failed operation is recorded and registration/heartbeat still return an
+  explicit retryable failure;
+- when a membership snapshot was successfully reconciled within
+  `unhealthy_after_ms`, readiness stays true and membership/placement reads use
+  that explicitly bounded last-good view;
+- an isolated readiness probe failure also stays ready inside this grace, so a
+  transient backend timeout does not eject the coordinator or amplify into a
+  cluster-wide client retry storm;
+- if there is no successfully installed snapshot, or its age exceeds
+  `unhealthy_after_ms`, readiness becomes false and new membership/placement
+  lookups fail closed;
+- a later backend health probe alone does not restore readiness: a successful
+  membership reconciliation must first install a current snapshot;
+- a management API request whose own snapshot fetch fails returns
+  `503 Service Unavailable`;
 - the UI may retain the last successful response locally but must mark it stale
   with its observation time.
 
-Existing clients continue using their short-lived placement and membership
-caches with normal replica fallback. A coordinator-local last-good snapshot may
-be exposed for diagnostics but is not used as an unmarked authoritative
-response.
+The grace is shorter than the lease TTL and uses the same threshold that marks a
+silent node unhealthy. It therefore absorbs a missed Kubernetes Lease LIST or
+etcd read without allowing stale local membership to become authoritative
+indefinitely. Existing clients also continue using their short-lived placement
+and membership caches with normal replica fallback.
 
 Liveness remains true while the process can run its event loop and serve the
 liveness endpoint. This distinction lets an orchestrator remove an unready
@@ -386,6 +397,13 @@ sequenceDiagram
         C2-->>W: acknowledged
     end
 ```
+
+Before its first completed status heartbeat, a worker has no control-plane
+failure grace and remains unready. After a successful heartbeat, one refused or
+timed-out coordinator connection does not immediately stop its data plane: the
+worker keeps retrying registration while retaining readiness for at most three
+heartbeat intervals, capped at 15 seconds. Continued failure beyond that bound
+makes it unready.
 
 ### Placement lookup
 
