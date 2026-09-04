@@ -70,10 +70,10 @@ may serve that generation from cache or conditionally fetch it from the origin;
 if the object was replaced and that generation is unavailable, the read fails
 with a version mismatch instead of returning bytes from the replacement.
 
-A range may span many Talon blocks. The client plans those blocks lazily and
-keeps at most 64 worker requests from one logical read active at a time. All
+A production Talon block is 256 MiB, so ordinary KiB/MiB ranges issue one
+worker request and application throughput comes from independent calls. All
 reads issued through the same `Client` share a 1024-request aggregate budget;
-the per-read window is a fairness control, not a process-wide QPS ceiling.
+rare cross-block reads use an internal fairness window.
 
 ## Threads
 

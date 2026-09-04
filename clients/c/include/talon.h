@@ -82,10 +82,10 @@ void talon_client_free(talon_client *client);
  * read), and a value larger than the object surfaces as a read error rather than
  * fabricated bytes. A caller with no valid size passes NULL.
  *
- * At most 64 block requests from one read are active concurrently. All reads
- * submitted through this client share an aggregate limit of 1024 active block
- * requests, so high-QPS workloads remain bounded without being serialized by
- * the per-read fairness window.
+ * With the production 256 MiB block size, ordinary KiB/MiB reads are one worker
+ * request; throughput comes from many independent talon_read_async calls. All
+ * calls through this client share an aggregate limit of 1024 active worker
+ * requests. Rare cross-block reads use an internal fairness window.
  */
 int talon_read_async(
     talon_client *client,

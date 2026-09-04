@@ -271,9 +271,10 @@ pub unsafe extern "C" fn talon_client_free(client: *mut TalonClient) {
 /// zero-byte read), and a value larger than the object surfaces as a read error
 /// rather than fabricated bytes. A caller that has no valid size passes NULL.
 ///
-/// At most 64 block requests from one read are active concurrently. All reads
-/// submitted through this client share an aggregate limit of 1024 active block
-/// requests.
+/// With the production 256 MiB block size, ordinary KiB/MiB reads are one
+/// worker request; throughput comes from independent `talon_read_async` calls.
+/// All calls through this client share an aggregate limit of 1024 active worker
+/// requests. Rare cross-block reads use an internal fairness window.
 #[no_mangle]
 pub unsafe extern "C" fn talon_read_async(
     client: *mut TalonClient,
@@ -984,12 +985,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn read_with_version_skips_stat() {
+    async fn read_with_exact_version_and_size_skips_stat_and_clamps() {
         let (client, stat_calls, observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
-        let object_size: u64 = 8192;
+        let object_size: u64 = 512;
         let mut dst = vec![0u8; 4096];
         let mut request_id = 0u64;
 
@@ -1010,9 +1011,10 @@ mod tests {
         assert_eq!(status, STATUS_OK);
         let snapshot = state.wait();
         assert_eq!(snapshot.status, STATUS_OK);
-        assert_eq!(snapshot.bytes_written, dst.len());
-        let expected: Vec<u8> = (0..dst.len()).map(|j| ((100 + j) % 251) as u8).collect();
-        assert_eq!(dst, expected);
+        assert_eq!(snapshot.bytes_written, 412);
+        let expected: Vec<u8> = (0..412).map(|j| ((100 + j) % 251) as u8).collect();
+        assert_eq!(&dst[..412], expected);
+        assert!(dst[412..].iter().all(|byte| *byte == 0));
         assert_eq!(
             stat_calls.load(Ordering::SeqCst),
             0,
@@ -1024,6 +1026,69 @@ mod tests {
             "the C caller's version must reach the worker unchanged"
         );
         assert!(snapshot.error.is_none());
+
+        unsafe {
+            talon_client_free(client);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_c_reads_keep_independent_buffers_and_exact_metadata() {
+        const READS: usize = 32;
+        const READ_BYTES: usize = 4096;
+
+        let (client, stat_calls, observed_versions) = new_client_counting(0).await;
+        let uri = cstring("s3://bucket/object.bin");
+        let version = cstring("shared-exact-version");
+        let object_size = 64_u64 << 20;
+        let states: Vec<_> = (0..READS).map(|_| CallbackState::new()).collect();
+        let mut buffers = vec![vec![0_u8; READ_BYTES]; READS];
+        let mut request_ids = Vec::with_capacity(READS);
+
+        for index in 0..READS {
+            let mut request_id = 0;
+            let status = unsafe {
+                talon_read_async(
+                    client,
+                    uri.as_ptr(),
+                    (index * READ_BYTES) as u64,
+                    buffers[index].as_mut_ptr(),
+                    buffers[index].len(),
+                    version.as_ptr(),
+                    &object_size,
+                    Some(capture_callback),
+                    states[index].user_data(),
+                    &mut request_id,
+                )
+            };
+            assert_eq!(status, STATUS_OK, "submission {index} failed");
+            request_ids.push(request_id);
+        }
+
+        for (index, state) in states.iter().enumerate() {
+            let snapshot = state.wait();
+            assert_eq!(
+                snapshot.status, STATUS_OK,
+                "read {index}: {:?}",
+                snapshot.error
+            );
+            assert_eq!(snapshot.request_id, request_ids[index]);
+            assert_eq!(snapshot.bytes_written, READ_BYTES);
+            let offset = index * READ_BYTES;
+            assert_eq!(buffers[index][0], (offset % 251) as u8);
+            assert_eq!(
+                buffers[index][READ_BYTES - 1],
+                ((offset + READ_BYTES - 1) % 251) as u8
+            );
+        }
+        let mut unique_ids = request_ids.clone();
+        unique_ids.sort_unstable();
+        unique_ids.dedup();
+        assert_eq!(unique_ids.len(), READS);
+        assert_eq!(stat_calls.load(Ordering::SeqCst), 0);
+        let versions = observed_versions.lock().unwrap();
+        assert_eq!(versions.len(), READS);
+        assert!(versions.iter().all(|value| value == "shared-exact-version"));
 
         unsafe {
             talon_client_free(client);

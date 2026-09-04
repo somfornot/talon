@@ -39,7 +39,9 @@ impl ControlOperation {
             ControlMessage::Heartbeat { .. } => Self::Heartbeat,
             ControlMessage::NodeStatusHeartbeat { .. } => Self::StatusHeartbeat,
             ControlMessage::PlacementLookup { .. } => Self::Placement,
-            ControlMessage::MembershipQuery {} => Self::Membership,
+            ControlMessage::MembershipQuery {} | ControlMessage::MembershipQueryV2 {} => {
+                Self::Membership
+            }
             _ => Self::Other,
         }
     }
@@ -418,6 +420,18 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+
+    #[test]
+    fn both_membership_protocol_versions_share_the_membership_metric() {
+        assert_eq!(
+            ControlOperation::from_message(&ControlMessage::MembershipQuery {}).label(),
+            "membership_query"
+        );
+        assert_eq!(
+            ControlOperation::from_message(&ControlMessage::MembershipQueryV2 {}).label(),
+            "membership_query"
+        );
+    }
 
     #[test]
     fn control_instrumentation_is_atomic_and_bounded() {

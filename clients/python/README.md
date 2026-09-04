@@ -34,10 +34,11 @@ rather than serialised on the interpreter.
 
 Passing both `version` and `size` to `read` skips the metadata lookup and pins
 the read to that exact source generation; Talon never substitutes newer bytes.
-Multi-block reads keep at most 64 worker requests active at once. Independent
-reads on one `Client` share an aggregate budget of 1024 active worker requests,
-so a single huge read cannot monopolize the client and many small reads remain
-bounded without being serialized behind a per-read window.
+With the production 256 MiB block size, ordinary KiB/MiB reads are one worker
+request; application throughput comes from independent reads. Reads on one
+`Client` share an aggregate budget of 1024 active worker requests, while rare
+cross-block reads use an internal fairness window so one huge request cannot
+monopolize the client.
 
 **Read-only in this release.** Writes go through the FUSE mount or the Rust
 client; `put`/`delete` are tracked separately.

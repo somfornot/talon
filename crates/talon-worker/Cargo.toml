@@ -35,6 +35,12 @@ path = "src/bin/loadgen.rs"
 name = "talon-serve-probe"
 path = "src/bin/serve_probe.rs"
 
+# Benchmark-only Talon frame proxy. It is deliberately separate from the
+# production worker so latency and fault injection cannot leak into serve code.
+[[bin]]
+name = "talon-client-bench-proxy"
+path = "src/bin/client_bench_proxy.rs"
+
 [dependencies]
 talon-core.workspace = true
 talon-metadata.workspace = true

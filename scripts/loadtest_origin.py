@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal blob origin for the data-plane load test (#291).
+"""Minimal blob origin for the native-client data-plane load tests.
 
-The load sweep measures the *serve* path: after the first fetch every request
-is a resident cache hit, so the origin is touched once per run. It still has to
-exist, because a worker resolves an object's version with a HEAD before serving
-and fails the read if that HEAD fails.
+Hot-cache sweeps touch the origin only while warming the object. Backend-delay
+sweeps deliberately use a working set larger than L2 capacity and repeatedly
+fetch 1 MiB pages from this server. A worker also resolves an object's version
+with HEAD and fails the read if that request fails.
 
 Implements only what `AzureBackend` requires:
   - HEAD  -> Content-Length + ETag
@@ -18,10 +18,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SIZE = 64 << 20  # 64 MiB synthetic blob
 ETAG = '"0x8LOADTEST"'
+_RAMP = bytes((i % 251) for i in range(251 * 64))
 
 
 def ramp(start: int, length: int) -> bytes:
-    return bytes((i % 251) for i in range(start, start + length))
+    """Build deterministic range bytes without a Python loop per output byte."""
+    period = len(_RAMP)
+    offset = start % period
+    needed = length + offset
+    repeats = (needed + period - 1) // period
+    return (_RAMP * repeats)[offset:offset + length]
 
 
 class Handler(BaseHTTPRequestHandler):

@@ -136,10 +136,10 @@ impl Client {
     /// `version` and `size` are resolved with a `stat` when omitted. Pass them
     /// to skip that round trip when they are already known — for example when
     /// reading many ranges of the same object. The supplied version is exact:
-    /// a worker never substitutes bytes from a newer generation. One logical
-    /// read keeps at most 64 block requests active concurrently. Independent
-    /// reads on this Client share an aggregate budget of 1024 active worker
-    /// requests.
+    /// a worker never substitutes bytes from a newer generation. Ordinary
+    /// KiB/MiB reads fit in one production-sized block; independent reads on
+    /// this Client share an aggregate budget of 1024 active worker requests.
+    /// Rare cross-block reads use an internal fairness window.
     #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None))]
     fn read<'py>(
         &self,

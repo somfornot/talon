@@ -112,105 +112,107 @@ Notes on running it:
 
 ## Native-client path load test
 
-`just client-path-bench` measures a different boundary from `talon-loadgen`.
-It drives the real Rust `Client`, including lazy block planning, exact-version
-requests, client-side placement, connection pooling, retries, and forced
-membership refresh. Protocol-compatible loopback coordinator and worker peers
-provide controlled response latency and failures:
+`just client-path-bench` measures the public C ABI through a real coordinator,
+worker, cache, and HTTP origin. The native load generator calls
+`talon_stat_async` once before startup, then passes that exact `(version, size)`
+to every `talon_read_async`. Callback completion immediately submits the next
+read for that slot, so `--concurrency` means independent in-flight application
+requests rather than blocks inside one artificial giant read.
 
 ```sh
-# Independent logical reads: find the application-concurrency knee.
-just client-path-bench --seconds 10 --scenario steady,failure,membership \
-  --delay-us 1000,5000 --concurrency 1,8,32,64,128,256,512
+# Fast build/startup/ABI/proxy check.
+just client-path-bench smoke
 
-# One large logical read: isolate the per-read block window.
-just client-path-bench --seconds 10 --scenario steady --concurrency 1 \
-  --blocks-per-read 256 --block-concurrency 8,32,64,96,128,256
-
-# Verify aggregate backpressure or produce machine-readable results.
-just client-path-bench --concurrency 512 --max-in-flight 64 --json
+# Individual full matrices, or all of them in sequence.
+just client-path-bench hot
+just client-path-bench latency
+just client-path-bench backend
+just client-path-bench failure
+just client-path-bench membership
+just client-path-bench all
 ```
 
-The axes are intentionally separate:
+Every measured object is 64 MiB and the client and worker block sizes remain at
+the production default of 256 MiB. Request sizes are independently swept at
+4 KiB, 64 KiB, and 1 MiB. The C load generator rejects a request at or above
+256 MiB and checks every generated range before submission; every output summary
+therefore records whether the workload remained below one block and whether all
+ranges touched exactly one block. Multi-block fan-out is not used to explain
+small-read QPS. Worker L1 is disabled in every scenario; L2 is paged at 1 MiB
+with a 256 MiB byte-accounted capacity.
 
-- `--concurrency` is the number of independent logical `Client::read_into`
-  calls. This is the important axis for application QPS.
-- `--block-concurrency` bounds block requests from **one** logical read. It is a
-  fairness window, not a process-wide request cap.
-- `--max-in-flight` is the aggregate block-request budget shared by a `Client`
-  and all its clones. It bounds socket and worker pressure across callers.
-- `failure` returns a typed, retryable `Unavailable` every
-  `--failure-every` worker attempts. `membership` alternates between two
-  workers every `--membership-switch-ms`, making the cached owner stale.
+Workers run with `RUST_LOG=warn`. The normal INFO stream contains one line per
+cache hit, which would turn a capacity run into tens of GiB of synchronous log
+output and measure the log sink instead of the data path. WARN still preserves
+unexpected worker failures, and the environment row records the filter.
 
-The terminal table summarizes successful logical QPS, worker-attempt QPS
-(including retries), latency, logical errors, failure/refresh counts, and peak
-worker requests. `--json` additionally records the full workload configuration,
-p95/max latency, membership switches, new connections, byte counts, and raw
-counters.
-The benchmark passes a known `(size, version)` to every read, matching callers
-that reuse a preceding stat and keeping per-read metadata RPCs out of the data
-path measurement.
+The single-block assertion is about Talon's 256 MiB logical block boundary,
+not the L2 page boundary. Offsets are 4 KiB aligned but otherwise random, so a
+1 MiB range will usually touch two adjacent 1 MiB L2 pages; the emitted L2 miss
+and backend-fetch counters intentionally include both pages.
 
-### Directional results and selected defaults
+The default matrices are:
 
-One release build on a 64-logical-CPU Intel Xeon Gold 6338 host, with 4 KiB
-single-block reads, a 4,096-block working set, 1 ms injected service delay, and
-2 s measured after 1 s warmup produced:
+- `hot`: direct worker, 3 s warmup, 10 s measurement, three repeats. 4 KiB and
+  64 KiB use concurrency `1,8,32,64,128,256,512,1024`; 1 MiB stops at 256 so
+  caller buffers alone do not exceed 256 MiB.
+- `latency`: the same hot-cache matrix through the standalone Talon-frame proxy
+  with `0,1,5,10 ms` response delay. The 0 ms arm quantifies proxy overhead and
+  proxy results are never presented as the direct worker ceiling.
+- `backend`: 1 MiB paged L2, 256 MiB capacity, a 1 GiB random working set, and
+  worker backend delays of `0,5,20,50 ms`. These rows report worker CPU/RSS,
+  L2 misses, and backend fetches separately from hot-cache rows.
+- `failure`: a proxy baseline followed by typed `Unavailable` on every 100th
+  attempt. The proxy preserves the original request id. Client logical errors,
+  worker/proxy attempts, injected failures, membership queries, and throughput
+  loss remain separate counters.
+- `membership`: two real workers with worker/coordinator heartbeat 100 ms,
+  unhealthy threshold 500 ms, and lease 1500 ms. The harness identifies the
+  current object owner from worker request metrics, runs steadily for 5 s,
+  kills that process, and emits one-second QPS/error buckets plus exclusion and
+  first-survivor timing.
 
-| logical concurrency | successful reads/s | p99 |
-|---:|---:|---:|
-| 32 | 10,972 | 3.51 ms |
-| 128 | 39,786 | 4.66 ms |
-| 512 | 94,283 | 7.93 ms |
-| 1,024 | 95,665 | 17.85 ms |
-| 2,048 | 95,117 | 28.55 ms |
+Raw JSON Lines go to `bench/results/c-client-latest.jsonl` (ignored by Git).
+The environment row records both the base commit and whether the measured tree
+was dirty. Each load row includes successful and logical-attempt QPS, MiB/s,
+p50/p95/p99/p999/max, submission and logical errors, the first error, requested
+and peak actual concurrency, and single-block assertions. Adjacent
+`stack_metrics` rows contain worker attempts, cache misses, backend fetches,
+membership queries, CPU/RSS, and proxy counters. Stack rates cover warmup plus
+measurement; `worker_attempts` excludes the one startup stat while
+`worker_requests_including_stat` retains the raw worker count. A loadgen
+`attempt` is one public `talon_read_async` call. `proxy_attempts` is more
+specifically the number of `GetVersionedRange` frames observed by the benchmark
+proxy: it excludes the startup stat and includes any client retry frames. Thus,
+in fault runs `retry_attempts` is the excess of proxy read-frame attempts over
+logical calls, and `retry_succeeded` removes final logical failures from that
+count. The summarizer reports median QPS and worst p99 across repeats:
 
-The client passes 10K QPS at 32 independent reads and plateaus between 512 and
-1,024 on this host. More callers above that point add queueing, not throughput.
-A control run with 512 callers and `--max-in-flight 64` observed exactly 64
-peak worker requests and 20,993 reads/s, confirming that the aggregate limiter
-rather than the caller count controls resource use.
+```sh
+python3 scripts/summarize_c_client_loadtest.py \
+  bench/results/c-client-latest.jsonl
+```
 
-At 5 ms injected service delay and 256 independent reads, the fault scenarios
-retained nearly all steady-state throughput:
+For shorter exploratory runs, all dimensions can be overridden without editing
+the harness, for example:
 
-| scenario | successful reads/s | p99 | logical errors | membership queries | worker failures |
-|---|---:|---:|---:|---:|---:|
-| steady | 34,569 | 9.15 ms | 0 | 0 | 0 |
-| 1% attempt failure | 33,835 | 11.26 ms | 4 | 36 | 691 injected |
-| membership switch / 500 ms | 34,052 | 15.06 ms | 0 | 3 | 768 stale-owner |
+```sh
+TALON_C_BENCH_WARMUP_SECONDS=1 \
+TALON_C_BENCH_MEASURE_SECONDS=3 \
+TALON_C_BENCH_REPEATS=1 \
+TALON_C_BENCH_SMALL_CONCURRENCY="32 128 512" \
+just client-path-bench hot
+```
 
-The 1% injector operates per attempt, so a retry can independently be selected
-for failure; those exhausted retries are reported as logical errors instead of
-being hidden. The much smaller membership-query count demonstrates refresh
-coalescing under a concurrent failure burst.
+`TALON_C_BENCH_L2_PAGE_SIZE` can override the 1 MiB page size for an explicit
+comparison; setting it to `0` selects whole-block L2 and is not the default
+capacity result.
 
-For a single 256-block logical read at 1 ms service delay, the per-read window
-sweep was:
-
-| block window | worker attempts/s | logical-read p99 | peak worker requests |
-|---:|---:|---:|---:|
-| 8 | 3,119 | 83.40 ms | 8 |
-| 32 | 9,963 | 29.90 ms | 32 |
-| **64** | **14,417** | **22.21 ms** | **64** |
-| 96 | 15,694 | 19.96 ms | 96 |
-| 128 | 16,146 | 20.16 ms | 128 |
-| 256 | 15,449 | 23.44 ms | 154 |
-
-Window 64 reaches 89% of the best measured block QPS with half the in-flight
-work of window 128; window 256 adds no throughput and worsens the tail. This is
-why the native client defaults to **64 per logical read** plus **1,024 across
-the Client and its clones**. The Rust builder exposes both limits for workloads
-with a different latency/resource trade-off.
-
-The 4 KiB block size in the fan-out run is deliberate: it creates many block
-requests without allocating a huge destination. Production C/Python defaults
-use 256 MiB blocks, where 256 blocks would represent a 64 GiB read. And because
-the synthetic worker writes bytes through userspace rather than using the real
-worker's `sendfile` path, these figures are client-path comparisons, not worker
-capacity claims. Pair them with `scripts/dataplane_loadtest.sh` for the real
-worker ceiling.
+10K successful reads/s is a product target to observe, not a hard-coded CI
+threshold. If a machine misses it, compare connection count, CPU/RSS, worker
+latency, proxy overhead, and backend counters before attributing the bottleneck.
+Absolute results are host-specific and this manual benchmark never blocks a
+merge.
 
 ## Object-store gateway
 

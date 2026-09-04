@@ -7,8 +7,9 @@ use tokio::sync::Semaphore;
 
 const PLACEMENT_TTL_MS: u64 = 30_000;
 const REPLICAS_K: u8 = 1;
-/// Default maximum number of worker block requests active in one logical read.
-pub const DEFAULT_MAX_CONCURRENT_BLOCK_READS: usize = 64;
+// Production reads normally touch one 256 MiB block. This private window only
+// prevents an unusually large cross-block read from monopolizing the client.
+const MAX_CONCURRENT_BLOCK_READS_PER_READ: usize = 8;
 /// Default maximum number of worker block requests active across Client clones.
 pub const DEFAULT_MAX_IN_FLIGHT_BLOCK_READS: usize = 1024;
 
@@ -18,7 +19,6 @@ pub struct Client {
     coordinator: CoordinatorClient,
     reader: BlockReader,
     block_size: u32,
-    max_concurrent_block_reads: usize,
     max_in_flight_block_reads: usize,
     block_read_permits: Arc<Semaphore>,
 }
@@ -36,21 +36,9 @@ impl Client {
             coordinator,
             reader,
             block_size,
-            max_concurrent_block_reads: DEFAULT_MAX_CONCURRENT_BLOCK_READS,
             max_in_flight_block_reads: DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,
             block_read_permits: Arc::new(Semaphore::new(DEFAULT_MAX_IN_FLIGHT_BLOCK_READS)),
         })
-    }
-
-    /// Set the maximum number of worker block requests active in one read.
-    pub fn with_max_concurrent_block_reads(mut self, max: usize) -> Result<Self, Error> {
-        if max == 0 {
-            return Err(Error::InvalidArgument(
-                "max_concurrent_block_reads must be non-zero".into(),
-            ));
-        }
-        self.max_concurrent_block_reads = max;
-        Ok(self)
     }
 
     /// Set the aggregate worker-request limit shared by this Client's clones.
@@ -79,11 +67,6 @@ impl Client {
         self.block_size
     }
 
-    /// Maximum number of worker block requests active in one logical read.
-    pub fn max_concurrent_block_reads(&self) -> usize {
-        self.max_concurrent_block_reads
-    }
-
     /// Maximum active worker block requests shared across Client clones.
     pub fn max_in_flight_block_reads(&self) -> usize {
         self.max_in_flight_block_reads
@@ -104,9 +87,8 @@ impl Client {
     /// When `known_stat` is supplied, its version is an exact source identity:
     /// workers may serve cached bytes for that generation or conditionally fill
     /// them from the backend, but never substitute a newer generation. A stale
-    /// version therefore returns a version-mismatch error. At most
-    /// [`max_concurrent_block_reads`](Self::max_concurrent_block_reads) block
-    /// requests from this logical read are active at once. Across simultaneous
+    /// version therefore returns a version-mismatch error. Unusually large
+    /// cross-block reads use an internal fairness window. Across simultaneous
     /// reads and Client clones, at most
     /// [`max_in_flight_block_reads`](Self::max_in_flight_block_reads) worker
     /// requests are active.
@@ -204,7 +186,7 @@ impl Client {
             .unwrap_or(0);
         let mut pending = FuturesUnordered::new();
         let mut rest = &mut dst[..planned_len];
-        for _ in 0..self.max_concurrent_block_reads {
+        for _ in 0..MAX_CONCURRENT_BLOCK_READS_PER_READ {
             let Some(segment) = plan.next() else {
                 break;
             };
@@ -675,28 +657,35 @@ mod tests {
     }
 
     #[test]
-    fn block_read_limits_have_nonzero_defaults_and_reject_zero() {
+    fn aggregate_block_read_limit_has_nonzero_default_and_rejects_zero() {
         let client = Client::new("127.0.0.1:7000", 8).unwrap();
-        assert_eq!(
-            client.max_concurrent_block_reads(),
-            DEFAULT_MAX_CONCURRENT_BLOCK_READS
-        );
         assert_eq!(
             client.max_in_flight_block_reads(),
             DEFAULT_MAX_IN_FLIGHT_BLOCK_READS
         );
-        let error = client
-            .with_max_concurrent_block_reads(0)
-            .err()
-            .expect("zero concurrency must be rejected");
-        assert!(matches!(error, Error::InvalidArgument(_)));
-
         let error = Client::new("127.0.0.1:7000", 8)
             .unwrap()
             .with_max_in_flight_block_reads(0)
             .err()
             .expect("zero aggregate concurrency must be rejected");
         assert!(matches!(error, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn default_aggregate_budget_is_exactly_1024_and_shared_by_clones() {
+        let client = Client::new("127.0.0.1:7000", 8).unwrap();
+        let clone = client.clone();
+        assert!(Arc::ptr_eq(
+            &client.block_read_permits,
+            &clone.block_read_permits
+        ));
+
+        let all = Arc::clone(&client.block_read_permits)
+            .try_acquire_many_owned(DEFAULT_MAX_IN_FLIGHT_BLOCK_READS as u32)
+            .expect("the default budget must contain exactly 1024 permits");
+        assert!(clone.block_read_permits.try_acquire().is_err());
+        drop(all);
+        assert!(clone.block_read_permits.try_acquire().is_ok());
     }
 
     #[tokio::test]
@@ -852,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn multi_block_read_refills_a_bounded_concurrency_window() {
+    async fn multi_block_read_refills_the_internal_eight_request_window() {
         let active = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(AtomicUsize::new(0));
@@ -867,39 +856,41 @@ mod tests {
         )
         .await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
-        let coordinator = mock_read_coordinator(worker, 16, stat_calls).await;
-        let client = Client::new(coordinator, 4)
-            .unwrap()
-            .with_max_concurrent_block_reads(2)
-            .unwrap();
+        let coordinator = mock_read_coordinator(worker, 10, stat_calls).await;
+        let client = Client::new(coordinator, 1).unwrap();
         let object = parse_uri("s3://bucket/key").unwrap();
         let stat = ObjectStat {
-            size: 16,
+            size: 10,
             version: "test-version".into(),
         };
         let read =
-            tokio::spawn(async move { client.read(&object, 0, Some(16), Some(&stat)).await });
+            tokio::spawn(async move { client.read(&object, 0, Some(10), Some(&stat)).await });
 
-        wait_for_started(&started, &started_notify, 2).await;
+        wait_for_started(
+            &started,
+            &started_notify,
+            MAX_CONCURRENT_BLOCK_READS_PER_READ,
+        )
+        .await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             started.load(Ordering::SeqCst),
-            2,
-            "a third block started before one of the first two completed"
+            MAX_CONCURRENT_BLOCK_READS_PER_READ,
+            "a ninth block started before one of the first eight completed"
         );
 
         release.add_permits(1);
-        wait_for_started(&started, &started_notify, 3).await;
-        release.add_permits(3);
+        wait_for_started(&started, &started_notify, 9).await;
+        release.add_permits(9);
         let bytes = tokio::time::timeout(Duration::from_secs(2), read)
             .await
             .expect("bounded read did not finish")
             .unwrap()
             .unwrap();
 
-        assert_eq!(bytes, (0_u8..16).collect::<Vec<_>>());
-        assert_eq!(started.load(Ordering::SeqCst), 4);
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        assert_eq!(bytes, (0_u8..10).collect::<Vec<_>>());
+        assert_eq!(started.load(Ordering::SeqCst), 10);
+        assert_eq!(peak.load(Ordering::SeqCst), 8);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

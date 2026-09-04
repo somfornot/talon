@@ -94,10 +94,10 @@ bench-check *ARGS:
 gateway-bench:
     cargo run --release -p talon-gateway --example gateway_benchmark
 
-# Exercise the real Rust Client, placement cache, connection pool, retries and
-# membership refreshes against controlled loopback worker/coordinator peers.
+# Exercise the public C ABI through a real coordinator, worker and origin.
+# MODE can be smoke, hot, latency, backend, failure, membership or all.
 client-path-bench *ARGS:
-    cargo run --release -p talon-rust-client --example client_path_benchmark -- {{ARGS}}
+    scripts/c_client_loadtest.sh {{ARGS}}
 
 # Benchmark the gateway's real S3 and Azure adapters against a live stack.
 # Requires the four gateways, two workers, two coordinators and the origin stub
