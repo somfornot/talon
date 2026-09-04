@@ -340,6 +340,27 @@ impl WorkerRuntime {
         }
     }
 
+    /// Serve an origin-backed range pinned to the caller's exact source version.
+    ///
+    /// Unlike [`serve`](Self::serve), this path never resolves or refreshes the
+    /// object's current version. A matching resident block remains readable;
+    /// an origin miss is fetched with `version` as an `If-Match` precondition,
+    /// and a changed source propagates `VersionMismatch` to the caller.
+    pub async fn serve_versioned(
+        &self,
+        request: &RangeRequest,
+        version: &Version,
+    ) -> anyhow::Result<ServeOutcome> {
+        self.ensure_configured_backend(request.object.backend)?;
+        if version.0.trim().is_empty() {
+            anyhow::bail!("version-pinned range request has an empty source version");
+        }
+        if request.len == 0 {
+            return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
+        }
+        self.serve_at(request, version).await
+    }
+
     /// Serve a versioned range only from resident cache state.
     ///
     /// Unlike [`serve`](Self::serve), this path neither resolves metadata nor
@@ -1859,6 +1880,18 @@ mod tests {
 
     use super::*;
 
+    fn expect_test_version(if_match: Option<&Version>, current: &str) -> Result<()> {
+        if let Some(expected) = if_match {
+            if expected.as_str() != current {
+                return Err(Error::VersionMismatch {
+                    expected: expected.0.clone(),
+                    found: current.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     struct MockBackend {
         calls: AtomicUsize,
     }
@@ -1872,6 +1905,17 @@ mod tests {
             } else {
                 Ok(Bytes::from_static(b"abcdefgh"))
             }
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -2926,6 +2970,17 @@ mod tests {
             Ok(Bytes::from(buf))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: u64::MAX,
@@ -2946,6 +3001,17 @@ mod tests {
             let n = len.min(self.block_size) as usize;
             let buf: Vec<u8> = (0..n).map(|i| ((offset + i as u64) % 251) as u8).collect();
             Ok(Bytes::from(buf))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -3115,6 +3181,17 @@ mod tests {
             Ok(Bytes::from_static(b"abcdefgh"))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: 8,
@@ -3194,6 +3271,18 @@ mod tests {
         async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
             Ok(self.body.lock().unwrap().clone())
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            let current = self.version.lock().unwrap().clone();
+            expect_test_version(if_match, &current)?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -3541,6 +3630,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_pinned_read_never_switches_to_a_newer_generation() {
+        let root = tmp_root();
+        let backend = Arc::new(CondBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-data-old-data")),
+            heads: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            enforce_precondition: true,
+        });
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
+        let object = ObjectId::new(Backend::Azure, "container", "obj");
+        let request = |offset| RangeRequest {
+            object: object.clone(),
+            offset,
+            len: 4,
+        };
+        let version_v1 = Version::new("v1");
+
+        let first = runtime
+            .serve_versioned(&request(0), &version_v1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"old-")
+        ));
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+
+        *backend.version.lock().unwrap() = "v2".into();
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-data-new-data");
+
+        let cached = runtime
+            .serve_versioned(&request(0), &version_v1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cached,
+            ServeOutcome::Sendfile(ref handle) if handle.len == 4
+        ));
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+
+        let error = runtime
+            .serve_versioned(&request(8), &version_v1)
+            .await
+            .err()
+            .expect("a pinned read must not refresh to v2");
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::VersionMismatch { expected, found })
+                if expected == "v1" && found == "v2"
+        ));
+        assert_eq!(
+            backend.heads.load(Ordering::SeqCst),
+            0,
+            "a version-pinned read must not resolve the current generation"
+        );
+
+        let current = runtime.serve(&request(8)).await.unwrap();
+        assert!(matches!(
+            current,
+            ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"new-")
+        ));
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    struct UnguardedBackend {
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackendStore for UnguardedBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::from_static(b"new-data"))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: 8,
+                version: Version::new("v2"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn version_pinned_miss_fails_closed_when_backend_cannot_enforce_it() {
+        let root = tmp_root();
+        let backend = Arc::new(UnguardedBackend {
+            fetches: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with(Arc::clone(&backend), WorkerMetrics::new(1024), &root, 8);
+
+        let error = runtime
+            .serve_versioned(&request("obj"), &Version::new("v1"))
+            .await
+            .err()
+            .expect("an unguarded backend must not return newer bytes");
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::Unsupported(message))
+                if message.contains("version-conditional read")
+        ));
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.block_count(), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn capacity_enforcement_evicts_coldest_blocks() {
         // Each distinct object is one 8-byte block. With a 16-byte cap, reading
         // three distinct objects must leave only two resident: committing the
@@ -3676,6 +3874,17 @@ mod tests {
                     .map(|i| ((offset + i as u64) % 251) as u8)
                     .collect::<Vec<u8>>(),
             ))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {

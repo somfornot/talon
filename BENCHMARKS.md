@@ -110,6 +110,108 @@ Notes on running it:
   refuses to turn error frames into latency numbers and prints the first error
   verbatim.
 
+## Native-client path load test
+
+`just client-path-bench` measures a different boundary from `talon-loadgen`.
+It drives the real Rust `Client`, including lazy block planning, exact-version
+requests, client-side placement, connection pooling, retries, and forced
+membership refresh. Protocol-compatible loopback coordinator and worker peers
+provide controlled response latency and failures:
+
+```sh
+# Independent logical reads: find the application-concurrency knee.
+just client-path-bench --seconds 10 --scenario steady,failure,membership \
+  --delay-us 1000,5000 --concurrency 1,8,32,64,128,256,512
+
+# One large logical read: isolate the per-read block window.
+just client-path-bench --seconds 10 --scenario steady --concurrency 1 \
+  --blocks-per-read 256 --block-concurrency 8,32,64,96,128,256
+
+# Verify aggregate backpressure or produce machine-readable results.
+just client-path-bench --concurrency 512 --max-in-flight 64 --json
+```
+
+The axes are intentionally separate:
+
+- `--concurrency` is the number of independent logical `Client::read_into`
+  calls. This is the important axis for application QPS.
+- `--block-concurrency` bounds block requests from **one** logical read. It is a
+  fairness window, not a process-wide request cap.
+- `--max-in-flight` is the aggregate block-request budget shared by a `Client`
+  and all its clones. It bounds socket and worker pressure across callers.
+- `failure` returns a typed, retryable `Unavailable` every
+  `--failure-every` worker attempts. `membership` alternates between two
+  workers every `--membership-switch-ms`, making the cached owner stale.
+
+The terminal table summarizes successful logical QPS, worker-attempt QPS
+(including retries), latency, logical errors, failure/refresh counts, and peak
+worker requests. `--json` additionally records the full workload configuration,
+p95/max latency, membership switches, new connections, byte counts, and raw
+counters.
+The benchmark passes a known `(size, version)` to every read, matching callers
+that reuse a preceding stat and keeping per-read metadata RPCs out of the data
+path measurement.
+
+### Directional results and selected defaults
+
+One release build on a 64-logical-CPU Intel Xeon Gold 6338 host, with 4 KiB
+single-block reads, a 4,096-block working set, 1 ms injected service delay, and
+2 s measured after 1 s warmup produced:
+
+| logical concurrency | successful reads/s | p99 |
+|---:|---:|---:|
+| 32 | 10,972 | 3.51 ms |
+| 128 | 39,786 | 4.66 ms |
+| 512 | 94,283 | 7.93 ms |
+| 1,024 | 95,665 | 17.85 ms |
+| 2,048 | 95,117 | 28.55 ms |
+
+The client passes 10K QPS at 32 independent reads and plateaus between 512 and
+1,024 on this host. More callers above that point add queueing, not throughput.
+A control run with 512 callers and `--max-in-flight 64` observed exactly 64
+peak worker requests and 20,993 reads/s, confirming that the aggregate limiter
+rather than the caller count controls resource use.
+
+At 5 ms injected service delay and 256 independent reads, the fault scenarios
+retained nearly all steady-state throughput:
+
+| scenario | successful reads/s | p99 | logical errors | membership queries | worker failures |
+|---|---:|---:|---:|---:|---:|
+| steady | 34,569 | 9.15 ms | 0 | 0 | 0 |
+| 1% attempt failure | 33,835 | 11.26 ms | 4 | 36 | 691 injected |
+| membership switch / 500 ms | 34,052 | 15.06 ms | 0 | 3 | 768 stale-owner |
+
+The 1% injector operates per attempt, so a retry can independently be selected
+for failure; those exhausted retries are reported as logical errors instead of
+being hidden. The much smaller membership-query count demonstrates refresh
+coalescing under a concurrent failure burst.
+
+For a single 256-block logical read at 1 ms service delay, the per-read window
+sweep was:
+
+| block window | worker attempts/s | logical-read p99 | peak worker requests |
+|---:|---:|---:|---:|
+| 8 | 3,119 | 83.40 ms | 8 |
+| 32 | 9,963 | 29.90 ms | 32 |
+| **64** | **14,417** | **22.21 ms** | **64** |
+| 96 | 15,694 | 19.96 ms | 96 |
+| 128 | 16,146 | 20.16 ms | 128 |
+| 256 | 15,449 | 23.44 ms | 154 |
+
+Window 64 reaches 89% of the best measured block QPS with half the in-flight
+work of window 128; window 256 adds no throughput and worsens the tail. This is
+why the native client defaults to **64 per logical read** plus **1,024 across
+the Client and its clones**. The Rust builder exposes both limits for workloads
+with a different latency/resource trade-off.
+
+The 4 KiB block size in the fan-out run is deliberate: it creates many block
+requests without allocating a huge destination. Production C/Python defaults
+use 256 MiB blocks, where 256 blocks would represent a 64 GiB read. And because
+the synthetic worker writes bytes through userspace rather than using the real
+worker's `sendfile` path, these figures are client-path comparisons, not worker
+capacity claims. Pair them with `scripts/dataplane_loadtest.sh` for the real
+worker ceiling.
+
 ## Object-store gateway
 
 `just gateway-bench` measures the bounded HTTP runtime around controlled

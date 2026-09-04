@@ -1,4 +1,4 @@
-use talon_cache_client::{BlockReadError, CoordinatorError};
+use talon_cache_client::{CacheReadError, CoordinatorError};
 
 /// Structured failures from parsing an object URI.
 #[derive(Debug, thiserror::Error)]
@@ -25,5 +25,5 @@ pub enum Error {
     #[error(transparent)]
     Coordinator(#[from] CoordinatorError),
     #[error(transparent)]
-    Block(#[from] BlockReadError),
+    Read(#[from] CacheReadError),
 }

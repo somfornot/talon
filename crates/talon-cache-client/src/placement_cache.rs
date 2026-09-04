@@ -48,6 +48,8 @@ pub struct Cached {
 struct Entry {
     cached: Cached,
     inserted_ms: u64,
+    /// Local membership-refresh generation used to coalesce forced refreshes.
+    membership_generation: u64,
 }
 
 /// A short-TTL placement cache keyed by [`BlockId`].
@@ -77,11 +79,25 @@ impl PlacementCache {
 
     /// Insert/replace a fresh placement for `block` observed at `now_ms`.
     pub fn insert(&self, block: BlockId, cached: Cached, now_ms: u64) {
+        self.insert_with_membership_generation(block, cached, now_ms, 0);
+    }
+
+    /// Insert a placement together with the local membership refresh that
+    /// produced it. This is private to the cache-client orchestration layer;
+    /// `epoch` remains the externally meaningful membership-content token.
+    pub(crate) fn insert_with_membership_generation(
+        &self,
+        block: BlockId,
+        cached: Cached,
+        now_ms: u64,
+        membership_generation: u64,
+    ) {
         self.entries.write_recover().insert(
             block,
             Entry {
                 cached,
                 inserted_ms: now_ms,
+                membership_generation,
             },
         );
     }
@@ -90,12 +106,23 @@ impl PlacementCache {
     ///
     /// An expired entry is treated as a miss (and lazily dropped).
     pub fn get(&self, block: &BlockId, now_ms: u64) -> Option<Cached> {
+        self.get_with_membership_generation(block, now_ms)
+            .map(|(cached, _)| cached)
+    }
+
+    /// Return a fresh placement and the local membership refresh generation
+    /// from which it was ranked.
+    pub(crate) fn get_with_membership_generation(
+        &self,
+        block: &BlockId,
+        now_ms: u64,
+    ) -> Option<(Cached, u64)> {
         // Fast path: shared lock.
         {
             let g = self.entries.read_recover();
             if let Some(e) = g.get(block) {
                 if now_ms.saturating_sub(e.inserted_ms) <= self.ttl_ms {
-                    return Some(e.cached.clone());
+                    return Some((e.cached.clone(), e.membership_generation));
                 }
             } else {
                 return None;

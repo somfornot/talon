@@ -22,7 +22,8 @@ use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use talon_rust_client::{
-    parse_uri, Client as RustClient, Error as RustError, ObjectStat as RustObjectStat,
+    parse_uri, CacheReadError, Client as RustClient, Error as RustError,
+    ObjectStat as RustObjectStat,
 };
 
 /// Runtime construction failures are infrastructure errors.
@@ -34,8 +35,10 @@ fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
 fn client_err(error: RustError) -> PyErr {
     let message = error.to_string();
     match error {
-        RustError::InvalidUri(_) | RustError::InvalidArgument(_) => PyValueError::new_err(message),
-        RustError::Coordinator(_) | RustError::Block(_) => PyIOError::new_err(message),
+        RustError::InvalidUri(_)
+        | RustError::InvalidArgument(_)
+        | RustError::Read(CacheReadError::InvalidRequest(_)) => PyValueError::new_err(message),
+        RustError::Coordinator(_) | RustError::Read(_) => PyIOError::new_err(message),
     }
 }
 
@@ -132,7 +135,11 @@ impl Client {
     ///
     /// `version` and `size` are resolved with a `stat` when omitted. Pass them
     /// to skip that round trip when they are already known — for example when
-    /// reading many ranges of the same object.
+    /// reading many ranges of the same object. The supplied version is exact:
+    /// a worker never substitutes bytes from a newer generation. One logical
+    /// read keeps at most 64 block requests active concurrently. Independent
+    /// reads on this Client share an aggregate budget of 1024 active worker
+    /// requests.
     #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None))]
     fn read<'py>(
         &self,
@@ -269,6 +276,10 @@ mod tests {
         assert_eq!(completed.version, "caller-version");
     }
 
+    // `extension-module` intentionally omits libpython linkage on Unix. The
+    // Python-client CI job runs these embedding tests without that feature;
+    // the all-features workspace job still compiles the extension itself.
+    #[cfg(not(feature = "extension-module"))]
     #[test]
     fn invalid_read_argument_raises_value_error() {
         pyo3::prepare_freethreaded_python();
@@ -289,9 +300,15 @@ mod tests {
             };
 
             assert!(error.is_instance_of::<PyValueError>(py));
+
+            let worker_error = client_err(RustError::Read(CacheReadError::InvalidRequest(
+                "worker rejected the range".into(),
+            )));
+            assert!(worker_error.is_instance_of::<PyValueError>(py));
         });
     }
 
+    #[cfg(not(feature = "extension-module"))]
     #[test]
     fn coordinator_failure_raises_io_error() {
         pyo3::prepare_freethreaded_python();

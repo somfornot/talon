@@ -66,6 +66,8 @@ talon_read_async(
     0,
     buffer,
     1 << 20,
+    NULL,  /* version: resolve it */
+    NULL,  /* object size: resolve it */
     on_read,
     NULL,
     &request_id);
@@ -77,6 +79,15 @@ exclusive access to that byte range: do not read, write, free, or reuse
 overlapping storage for another operation until the callback runs. A zero-length
 read may pass `NULL` for the buffer. The callback receives a `talon_result`;
 release it with `talon_result_free`.
+
+If a preceding `talon_stat_async` already supplied both the object version and
+size, pass them to `talon_read_async` to skip another stat. The version is an
+exact source identity: workers may serve cached bytes for it or conditionally
+fetch it from the backend, but never return bytes from a newer generation. A
+multi-block read plans blocks lazily and keeps at most 64 worker requests from
+that read active concurrently. Across all reads submitted through one client, a
+shared 1024-request budget bounds aggregate socket and worker pressure. The
+64-request window is therefore per read, not a process-wide QPS ceiling.
 
 The client handle must also remain alive until callbacks for submitted
 operations have run. Freeing it earlier cancels in-flight work.

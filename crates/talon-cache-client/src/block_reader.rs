@@ -21,6 +21,7 @@
 //! membership token is seen. Multi-block splitting is handled by
 //! [`crate::read_plan`]; protocol frontends own their prefetch policy.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use talon_core::{BlockId, ObjectId, Version};
@@ -104,6 +105,10 @@ pub struct BlockReader {
     membership: Arc<MembershipCache>,
     /// Serializes cold refreshes so an expired snapshot causes one control request.
     membership_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic process-local token for completed membership refresh attempts.
+    /// Placements retain the token that produced them so concurrent failures
+    /// can share one forced refresh even when membership content is unchanged.
+    membership_refresh_generation: Arc<AtomicU64>,
     /// This reader's own deployment zone, for read classification (ADR 0006).
     zone: Option<String>,
     /// Sink for zone-classified read events; defaults to a no-op.
@@ -139,6 +144,7 @@ impl BlockReader {
             worker_pool: Arc::new(ConnectionPool::new()),
             membership,
             membership_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            membership_refresh_generation: Arc::new(AtomicU64::new(0)),
             zone: None,
             zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
         }
@@ -161,6 +167,8 @@ impl BlockReader {
         self.membership = Arc::new(
             MembershipCache::new(self.cache.ttl_ms()).with_zone_affinity(zone.clone(), enabled),
         );
+        self.membership_refresh = Arc::new(tokio::sync::Mutex::new(()));
+        self.membership_refresh_generation = Arc::new(AtomicU64::new(0));
         self.zone = zone;
         self.zone_observer = observer;
         self
@@ -303,16 +311,53 @@ impl BlockReader {
         dst: &mut [u8],
         now_ms: u64,
     ) -> Result<usize, BlockReadError> {
-        let cached = match self.cache.get(block, now_ms) {
-            Some(cached) => {
-                self.stats.record_cache_hit();
-                cached
-            }
-            None => {
-                self.stats.record_cache_miss();
-                self.resolve_and_cache(block, now_ms).await?
-            }
-        };
+        match self
+            .read_block_into_detailed(block, offset_in_block, dst, now_ms)
+            .await
+        {
+            Ok(written) => Ok(written),
+            Err(DetailedBlockReadError::Block(error)) => Err(error),
+            Err(DetailedBlockReadError::Worker(_)) => Err(BlockReadError::AllReplicasFailed),
+        }
+    }
+
+    /// Read into `dst` while preserving stable worker failure classifications.
+    ///
+    /// Protocol frontends should use this variant when callers need to
+    /// distinguish not-found, version mismatch, origin failure, rate limiting,
+    /// and infrastructure unavailability. [`read_block_into`](Self::read_block_into)
+    /// retains its historical aggregate error for FUSE-compatible callers.
+    pub async fn read_block_into_typed(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        dst: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize, CacheReadError> {
+        self.read_block_into_detailed(block, offset_in_block, dst, now_ms)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn read_block_into_detailed(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        dst: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize, DetailedBlockReadError> {
+        let (cached, membership_generation) =
+            match self.cache.get_with_membership_generation(block, now_ms) {
+                Some(cached) => {
+                    self.stats.record_cache_hit();
+                    cached
+                }
+                None => {
+                    self.stats.record_cache_miss();
+                    self.resolve_and_cache_with_generation(block, now_ms)
+                        .await?
+                }
+            };
         let abs_offset = block.offset + u64::from(offset_in_block);
 
         match self
@@ -325,19 +370,20 @@ impl BlockReader {
             }
             Err(failure) => {
                 if !failure.retryable {
-                    return Err(BlockReadError::AllReplicasFailed);
+                    return Err(DetailedBlockReadError::Worker(failure.error));
                 }
                 tracing::debug!(%block, reason = ?failure.reason, "all cached replicas failed; refreshing placement");
                 self.cache.invalidate(block, failure.reason);
-                self.stats.record_coordinator_refresh();
             }
         }
 
-        let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
+        let fresh = self
+            .resolve_and_cache_forced(block, now_ms, membership_generation)
+            .await?;
         let n = self
             .try_replicas_into(block, &fresh.replicas, abs_offset, dst)
             .await
-            .map_err(|_| BlockReadError::AllReplicasFailed)?;
+            .map_err(|failure| DetailedBlockReadError::Worker(failure.error))?;
         self.stats.add_bytes_served(n as u64);
         Ok(n)
     }
@@ -354,16 +400,18 @@ impl BlockReader {
         len: u32,
         now_ms: u64,
     ) -> Result<Vec<u8>, DetailedBlockReadError> {
-        let cached = match self.cache.get(block, now_ms) {
-            Some(c) => {
-                self.stats.record_cache_hit();
-                c
-            }
-            None => {
-                self.stats.record_cache_miss();
-                self.resolve_and_cache(block, now_ms).await?
-            }
-        };
+        let (cached, membership_generation) =
+            match self.cache.get_with_membership_generation(block, now_ms) {
+                Some(cached) => {
+                    self.stats.record_cache_hit();
+                    cached
+                }
+                None => {
+                    self.stats.record_cache_miss();
+                    self.resolve_and_cache_with_generation(block, now_ms)
+                        .await?
+                }
+            };
         let abs_offset = block.offset + offset_in_block as u64;
 
         // First pass: walk the cached replica list in order.
@@ -383,11 +431,12 @@ impl BlockReader {
                 // single membership refresh before giving up.
                 tracing::debug!(%block, reason = ?failure.reason, "all cached replicas failed; refreshing placement");
                 self.cache.invalidate(block, failure.reason);
-                self.stats.record_coordinator_refresh();
             }
         }
 
-        let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
+        let fresh = self
+            .resolve_and_cache_forced(block, now_ms, membership_generation)
+            .await?;
         let bytes = self
             .try_replicas(block, &fresh.replicas, abs_offset, len)
             .await
@@ -424,7 +473,7 @@ impl BlockReader {
             let worker = WorkerClient::with_pool(addr.clone(), Arc::clone(&self.worker_pool));
             self.stats.record_worker_fetch();
             match worker
-                .fetch_range(&block.object, abs_offset, len as u64)
+                .fetch_versioned_range(&block.object, &block.version, abs_offset, len as u64)
                 .await
             {
                 Ok(bytes) if bytes.len() as u64 == u64::from(len) => {
@@ -489,7 +538,7 @@ impl BlockReader {
             let worker = WorkerClient::with_pool(addr.clone(), Arc::clone(&self.worker_pool));
             self.stats.record_worker_fetch();
             match worker
-                .fetch_range_into(&block.object, abs_offset, dst)
+                .fetch_versioned_range_into(&block.object, &block.version, abs_offset, dst)
                 .await
             {
                 Ok(n) if n == dst.len() => {
@@ -659,25 +708,38 @@ impl BlockReader {
         block: &BlockId,
         now_ms: u64,
     ) -> Result<Cached, BlockReadError> {
-        self.resolve_and_cache_inner(block, now_ms, false).await
+        self.resolve_and_cache_with_generation(block, now_ms)
+            .await
+            .map(|(cached, _)| cached)
+    }
+
+    async fn resolve_and_cache_with_generation(
+        &self,
+        block: &BlockId,
+        now_ms: u64,
+    ) -> Result<(Cached, u64), BlockReadError> {
+        self.resolve_and_cache_inner(block, now_ms, None).await
     }
 
     async fn resolve_and_cache_forced(
         &self,
         block: &BlockId,
         now_ms: u64,
+        observed_generation: u64,
     ) -> Result<Cached, BlockReadError> {
-        self.resolve_and_cache_inner(block, now_ms, true).await
+        self.resolve_and_cache_inner(block, now_ms, Some(observed_generation))
+            .await
+            .map(|(cached, _)| cached)
     }
 
     async fn resolve_and_cache_inner(
         &self,
         block: &BlockId,
         now_ms: u64,
-        force_membership_refresh: bool,
-    ) -> Result<Cached, BlockReadError> {
-        let membership = self
-            .membership_snapshot(now_ms, force_membership_refresh)
+        force_after_generation: Option<u64>,
+    ) -> Result<(Cached, u64), BlockReadError> {
+        let (membership, membership_generation) = self
+            .membership_snapshot(now_ms, force_after_generation)
             .await?;
         if membership.affinity_fallback {
             self.zone_observer.affinity_fallback();
@@ -703,8 +765,13 @@ impl BlockReader {
             replicas,
             epoch: membership.epoch,
         };
-        self.cache.insert(block.clone(), cached.clone(), now_ms);
-        Ok(cached)
+        self.cache.insert_with_membership_generation(
+            block.clone(),
+            cached.clone(),
+            now_ms,
+            membership_generation,
+        );
+        Ok((cached, membership_generation))
     }
 
     /// Classify one served worker read against this reader's zone and report
@@ -725,18 +792,37 @@ impl BlockReader {
     async fn membership_snapshot(
         &self,
         now_ms: u64,
-        force_refresh: bool,
-    ) -> Result<MembershipSnapshot, BlockReadError> {
-        if !force_refresh {
+        force_after_generation: Option<u64>,
+    ) -> Result<(MembershipSnapshot, u64), BlockReadError> {
+        if let Some(observed) = force_after_generation {
+            let current = self.membership_refresh_generation.load(Ordering::Acquire);
+            if current != observed {
+                if let Some(snapshot) = self.membership.last_good() {
+                    return Ok((snapshot, current));
+                }
+            }
+        } else {
             if let Some(snapshot) = self.membership.fresh(now_ms) {
-                return Ok(snapshot);
+                let generation = self.membership_refresh_generation.load(Ordering::Acquire);
+                return Ok((snapshot, generation));
             }
         }
         let _refresh = self.membership_refresh.lock().await;
-        if !force_refresh {
-            if let Some(snapshot) = self.membership.fresh(now_ms) {
-                return Ok(snapshot);
+        if let Some(observed) = force_after_generation {
+            let current = self.membership_refresh_generation.load(Ordering::Acquire);
+            if current != observed {
+                if let Some(snapshot) = self.membership.last_good() {
+                    return Ok((snapshot, current));
+                }
             }
+        } else {
+            if let Some(snapshot) = self.membership.fresh(now_ms) {
+                let generation = self.membership_refresh_generation.load(Ordering::Acquire);
+                return Ok((snapshot, generation));
+            }
+        }
+        if force_after_generation.is_some() {
+            self.stats.record_coordinator_refresh();
         }
         match self.coordinator.membership_zoned(now_ms).await {
             Ok(members) => {
@@ -744,17 +830,28 @@ impl BlockReader {
                 if changed {
                     self.cache.clear();
                 }
-                Ok(snapshot)
+                // Publish the generation only after every cache side effect of
+                // the refresh is complete. Waiters that observe it may start
+                // inserting placements from `snapshot` immediately.
+                let generation = self.advance_membership_refresh_generation();
+                Ok((snapshot, generation))
             }
             Err(error) => {
                 if let Some(snapshot) = self.membership.last_good() {
+                    let generation = self.advance_membership_refresh_generation();
                     tracing::warn!(%error, "membership refresh failed; using last-good snapshot");
-                    Ok(snapshot)
+                    Ok((snapshot, generation))
                 } else {
                     Err(error.into())
                 }
             }
         }
+    }
+
+    fn advance_membership_refresh_generation(&self) -> u64 {
+        self.membership_refresh_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1)
     }
 }
 
@@ -774,6 +871,7 @@ fn replica_retryable(error: &WorkerError) -> bool {
                 | talon_transport::DataErrorCode::NotFound
                 | talon_transport::DataErrorCode::VersionMismatch
                 | talon_transport::DataErrorCode::Origin
+                | talon_transport::DataErrorCode::RateLimited
         ),
         _ => true,
     }
@@ -785,12 +883,13 @@ mod tests {
     use talon_core::{Backend, NodeId, NodeInfo, NodeRole, ObjectId, Version};
     use talon_transport::frame::{FrameHeader, HEADER_LEN};
     use talon_transport::{
-        decode_cached_block_put_header, decode_cached_request, decode_request, encode_error,
-        encode_typed_error, response_header_ok, ControlMessage, DataErrorCode, MsgType,
-        RangeRequest,
+        decode_cached_block_put_header, decode_cached_request, decode_versioned_request,
+        encode_error, encode_typed_error, response_header_ok, ControlMessage, DataErrorCode,
+        MsgType, RangeRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Barrier;
 
     fn block() -> BlockId {
         BlockId::new(
@@ -799,6 +898,12 @@ mod tests {
             256 << 20,
             Version::new("v1"),
         )
+    }
+
+    fn decode_read_request(frame: &[u8]) -> RangeRequest {
+        let (_, request) = decode_versioned_request(frame).unwrap();
+        assert_eq!(request.version, Version::new("v1"));
+        request.request
     }
 
     /// A mock coordinator that advertises one worker membership entry.
@@ -855,6 +960,54 @@ mod tests {
         addr
     }
 
+    /// A coordinator that advertises `first_worker` once and `next_worker` on
+    /// every subsequent membership query, while counting actual RPCs.
+    async fn mock_switching_coordinator(
+        first_worker: String,
+        next_worker: String,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let first_worker = first_worker.clone();
+                let next_worker = next_worker.clone();
+                let calls = Arc::clone(&calls);
+                tokio::spawn(async move {
+                    let mut header = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let decoded = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0_u8; decoded.length as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let worker = if call == 0 { first_worker } else { next_worker };
+                    let response = ControlMessage::MembershipListV2 {
+                        nodes: vec![talon_transport::ZonedNodeInfo {
+                            info: NodeInfo {
+                                id: NodeId::new("w1"),
+                                address: worker,
+                                role: NodeRole::Worker,
+                            },
+                            zone: None,
+                        }],
+                    };
+                    socket
+                        .write_all(&talon_transport::encode(0, &response).unwrap())
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        addr
+    }
+
     /// A mock worker that returns deterministic bytes for the requested range,
     /// and records how many fetches it served.
     async fn mock_worker(hits: Arc<std::sync::atomic::AtomicU32>) -> String {
@@ -877,7 +1030,7 @@ mod tests {
                     s.read_exact(&mut body).await.unwrap();
                     let mut full = hdr.to_vec();
                     full.extend_from_slice(&body);
-                    let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    let req = decode_read_request(&full);
                     hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     // Encode the absolute offset into the bytes so tests can
                     // verify the worker got the right sub-range.
@@ -925,6 +1078,76 @@ mod tests {
         addr
     }
 
+    async fn spawn_barrier_error_worker(
+        requests: Arc<std::sync::atomic::AtomicU32>,
+        barrier: Arc<Barrier>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let requests = Arc::clone(&requests);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    let mut header = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let decoded = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0_u8; decoded.length as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    barrier.wait().await;
+                    socket
+                        .write_all(&encode_error(decoded.request_id, "stale owner"))
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        addr
+    }
+
+    async fn spawn_typed_error_worker(
+        code: DataErrorCode,
+        requests: Arc<std::sync::atomic::AtomicU32>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let requests = Arc::clone(&requests);
+                tokio::spawn(async move {
+                    let mut header = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let decoded = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0_u8; decoded.length as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    socket
+                        .write_all(&encode_typed_error(
+                            decoded.request_id,
+                            code,
+                            "injected typed failure",
+                        ))
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        addr
+    }
+
     /// A mock worker that returns a self-consistent but one-byte-short success
     /// frame, counting how many requests it saw.
     async fn spawn_short_reply_worker(count: Arc<std::sync::atomic::AtomicU32>) -> String {
@@ -947,7 +1170,7 @@ mod tests {
                     s.read_exact(&mut body).await.unwrap();
                     let mut full = hdr.to_vec();
                     full.extend_from_slice(&body);
-                    let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    let req = decode_read_request(&full);
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let short_len = req.len.saturating_sub(1) as usize;
                     let payload = vec![0u8; short_len];
@@ -1312,6 +1535,98 @@ mod tests {
         let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache, 1);
         let err = reader.read_block(&block(), 0, 16, 0).await.unwrap_err();
         assert!(matches!(err, BlockReadError::AllReplicasFailed));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_block_failures_share_one_forced_membership_refresh() {
+        const BLOCKS: u32 = 4;
+        let stale_requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stale_worker = spawn_barrier_error_worker(
+            Arc::clone(&stale_requests),
+            Arc::new(Barrier::new(BLOCKS as usize)),
+        )
+        .await;
+        let fresh_requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fresh_worker = mock_worker(Arc::clone(&fresh_requests)).await;
+        let membership_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let coordinator =
+            mock_switching_coordinator(stale_worker, fresh_worker, Arc::clone(&membership_calls))
+                .await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(10_000)),
+            1,
+        );
+
+        let reads = (0..BLOCKS).map(|index| {
+            let reader = reader.clone();
+            async move {
+                let mut requested = block();
+                requested.offset = u64::from(index) * u64::from(requested.block_size);
+                reader.read_block(&requested, 0, 16, 0).await
+            }
+        });
+        for result in futures::future::join_all(reads).await {
+            assert_eq!(result.unwrap().len(), 16);
+        }
+
+        assert_eq!(
+            stale_requests.load(std::sync::atomic::Ordering::SeqCst),
+            BLOCKS,
+            "every block must first observe the stale placement"
+        );
+        assert_eq!(
+            fresh_requests.load(std::sync::atomic::Ordering::SeqCst),
+            BLOCKS,
+            "every block must retry against the refreshed worker"
+        );
+        assert_eq!(
+            membership_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one cold lookup plus one shared forced refresh are sufficient"
+        );
+        assert_eq!(
+            reader.stats().snapshot().coordinator_refreshes,
+            1,
+            "the metric counts the one actual forced refresh, not its waiters"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_rate_limit_is_preserved_without_retry_or_membership_refresh() {
+        let worker_requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker =
+            spawn_typed_error_worker(DataErrorCode::RateLimited, Arc::clone(&worker_requests))
+                .await;
+        let membership_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let coordinator =
+            mock_switching_coordinator(worker.clone(), worker, Arc::clone(&membership_calls)).await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(10_000)),
+            1,
+        );
+        let mut dst = [0_u8; 16];
+
+        let error = reader
+            .read_block_into_typed(&block(), 0, &mut dst, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CacheReadError::RateLimited(message) if message == "injected typed failure"
+        ));
+        assert_eq!(
+            worker_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "rate limiting must not be retried immediately"
+        );
+        assert_eq!(
+            membership_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "rate limiting is not a placement failure"
+        );
+        assert_eq!(reader.stats().snapshot().coordinator_refreshes, 0);
     }
 
     #[tokio::test]

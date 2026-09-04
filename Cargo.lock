@@ -2753,7 +2753,11 @@ dependencies = [
 name = "talon-rust-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "futures",
+ "serde",
+ "serde_json",
  "talon-cache-client",
  "talon-core",
  "talon-transport",

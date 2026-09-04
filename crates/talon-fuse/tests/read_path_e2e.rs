@@ -27,9 +27,7 @@ use talon_core::{
 };
 use talon_fuse::{BlockReader, CoordinatorClient, FileView, PlacementCache};
 use talon_transport::frame::{FrameHeader, HEADER_LEN};
-use talon_transport::{
-    decode_request, encode_error, response_header_ok, ControlMessage, RangeRequest,
-};
+use talon_transport::{decode_versioned_request, encode_error, response_header_ok, ControlMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -72,7 +70,8 @@ async fn spawn_worker(counters: Arc<WorkerCounters>, fail_all: bool) -> String {
                 sock.read_exact(&mut body).await.unwrap();
                 let mut full = hdr.to_vec();
                 full.extend_from_slice(&body);
-                let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                let (_h, versioned) = decode_versioned_request(&full).unwrap();
+                let req = versioned.request;
                 counters.fetches.fetch_add(1, Ordering::SeqCst);
 
                 if fail_all {

@@ -389,16 +389,6 @@ async fn drive_one_pipelined(
         } else if recording {
             latencies.push(t0.elapsed().as_nanos() as u64);
         }
-        if header.flags.contains(talon_transport::Flags::ERROR) {
-            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
-                eprintln!(
-                    "first error response: {}",
-                    String::from_utf8_lossy(&body[..len])
-                );
-            }
-        } else if recording {
-            latencies.push(t0.elapsed().as_nanos() as u64);
-        }
         // Returning the credit after recording keeps the window at `depth`.
         // A closed channel means the writer is gone; the next recv ends the run.
         if credit_tx.send(()).await.is_err() {

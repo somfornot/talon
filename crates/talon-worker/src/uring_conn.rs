@@ -57,7 +57,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use monoio::net::TcpStream;
-use talon_core::{BlockHandle, RequestId, TenantId};
+use talon_core::{BlockHandle, RequestId, TenantId, Version};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::uring::{write_all, write_all_buf, BufferedFrameReader};
@@ -163,7 +163,10 @@ pub async fn handle_conn(
                 .await?;
                 continue;
             }
-            MsgType::GetRange | MsgType::GetRangeTenant => {}
+            MsgType::GetRange
+            | MsgType::GetRangeTenant
+            | MsgType::GetVersionedRange
+            | MsgType::GetVersionedRangeTenant => {}
             // A data listener serves only GetRange/Put/Delete; anything else is
             // rejected before any per-request work.
             _ => {
@@ -180,7 +183,7 @@ pub async fn handle_conn(
             }
         }
 
-        let (h, req, tenant) = match decode_range_with_tenant(&header, &payload) {
+        let (h, req, expected_version, tenant) = match decode_range_with_tenant(&header, &payload) {
             Ok(v) => v,
             Err(e) => {
                 let err = data::encode_typed_error(
@@ -238,6 +241,22 @@ pub async fn handle_conn(
             continue;
         }
 
+        if expected_version
+            .as_ref()
+            .is_some_and(|version| version.0.trim().is_empty())
+        {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::InvalidRequest,
+                "version-pinned range request has an empty source version",
+            );
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            continue;
+        }
+
         if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
             let err = data::encode_typed_error(
                 h.request_id,
@@ -255,7 +274,11 @@ pub async fn handle_conn(
             continue;
         }
 
-        match worker.serve(&req).await {
+        let outcome = match expected_version.as_ref() {
+            Some(version) => worker.serve_versioned(&req, version).await,
+            None => worker.serve(&req).await,
+        };
+        match outcome {
             Ok(ServeOutcome::Sendfile(handle)) => {
                 let len = handle.len;
                 let hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
@@ -321,19 +344,42 @@ pub async fn handle_conn(
     }
 }
 
-/// Decode a `GetRange` or `GetRangeTenant` frame into its request and the tenant
-/// it declared (`Unattributed` for a plain `GetRange`).
+/// Decode any origin-backed range frame into its coordinates, optional exact
+/// version, and declared tenant.
 fn decode_range_with_tenant(
     header: &FrameHeader,
     payload: &[u8],
-) -> Result<(FrameHeader, data::RangeRequest, TenantId), talon_transport::DataError> {
+) -> Result<(FrameHeader, data::RangeRequest, Option<Version>, TenantId), talon_transport::DataError>
+{
     let buf = rejoin(header, payload);
-    if header.msg_type == MsgType::GetRangeTenant {
-        let (frame, scoped) = data::decode_tenant_request(&buf)?;
-        Ok((frame, scoped.request, scoped.tenant))
-    } else {
-        let (frame, req) = data::decode_request(&buf)?;
-        Ok((frame, req, TenantId::Unattributed))
+    match header.msg_type {
+        MsgType::GetRange => {
+            let (frame, request) = data::decode_request(&buf)?;
+            Ok((frame, request, None, TenantId::Unattributed))
+        }
+        MsgType::GetRangeTenant => {
+            let (frame, scoped) = data::decode_tenant_request(&buf)?;
+            Ok((frame, scoped.request, None, scoped.tenant))
+        }
+        MsgType::GetVersionedRange => {
+            let (frame, versioned) = data::decode_versioned_request(&buf)?;
+            Ok((
+                frame,
+                versioned.request,
+                Some(versioned.version),
+                TenantId::Unattributed,
+            ))
+        }
+        MsgType::GetVersionedRangeTenant => {
+            let (frame, scoped) = data::decode_versioned_tenant_request(&buf)?;
+            Ok((
+                frame,
+                scoped.request.request,
+                Some(scoped.request.version),
+                scoped.tenant,
+            ))
+        }
+        other => Err(talon_transport::DataError::NotGetRange(other)),
     }
 }
 
@@ -898,7 +944,8 @@ mod tests {
     };
     use talon_transport::data::{
         encode_cached_block_put_header, encode_delete, encode_put_header, encode_request,
-        CachedBlockPutRequest, CachedRangeRequest, DeleteRequest, PutRequest, RangeRequest,
+        encode_versioned_request, CachedBlockPutRequest, CachedRangeRequest, DeleteRequest,
+        PutRequest, RangeRequest, VersionedRangeRequest,
     };
     use talon_transport::Flags;
 
@@ -921,6 +968,23 @@ mod tests {
                     .map(|i| ((offset + i) % 251) as u8)
                     .collect::<Vec<u8>>(),
             ))
+        }
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            if let Some(expected) = if_match {
+                if expected.as_str() != "v1" {
+                    return Err(talon_core::Error::VersionMismatch {
+                        expected: expected.0.clone(),
+                        found: "v1".into(),
+                    });
+                }
+            }
+            self.fetch_range(object, offset, len).await
         }
         async fn head(&self, _o: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
@@ -948,6 +1012,23 @@ mod tests {
             let start = (offset as usize).min(full.len());
             let end = (start + len as usize).min(full.len());
             Ok(full.slice(start..end))
+        }
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            if let Some(expected) = if_match {
+                if expected.as_str() != "v1" {
+                    return Err(talon_core::Error::VersionMismatch {
+                        expected: expected.0.clone(),
+                        found: "v1".into(),
+                    });
+                }
+            }
+            self.fetch_range(object, offset, len).await
         }
         async fn head(&self, o: &ObjectId) -> Result<ObjectStat> {
             let objs = self.objects.lock().unwrap();
@@ -1071,7 +1152,19 @@ mod tests {
 
             // First is a miss (Bytes), second a resident hit (sendfile).
             for pass in 0..2 {
-                let (r, _) = c.write_all(encode_request(0, &req).unwrap()).await;
+                let wire = if pass == 0 {
+                    encode_request(0, &req).unwrap()
+                } else {
+                    encode_versioned_request(
+                        0,
+                        &VersionedRangeRequest {
+                            request: req.clone(),
+                            version: Version::new("v1"),
+                        },
+                    )
+                    .unwrap()
+                };
+                let (r, _) = c.write_all(wire).await;
                 r.unwrap();
                 let (header, body) = read_response(&mut c).await;
                 assert!(

@@ -65,7 +65,15 @@ for offset in range(0, info.size, chunk_size):
 ```
 
 Passing `size` as well lets the client clamp at end-of-file without another
-lookup.
+lookup. The supplied version identifies one exact source generation. A worker
+may serve that generation from cache or conditionally fetch it from the origin;
+if the object was replaced and that generation is unavailable, the read fails
+with a version mismatch instead of returning bytes from the replacement.
+
+A range may span many Talon blocks. The client plans those blocks lazily and
+keeps at most 64 worker requests from one logical read active at a time. All
+reads issued through the same `Client` share a 1024-request aggregate budget;
+the per-read window is a fairness control, not a process-wide QPS ceiling.
 
 ## Threads
 
