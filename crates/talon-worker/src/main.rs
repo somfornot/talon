@@ -43,8 +43,8 @@ use talon_worker::tokio_conn::{handle_conn, read_control};
 #[cfg(target_os = "linux")]
 use talon_worker::uring_conn;
 use talon_worker::{
-    serve_admin, BlockIndex, InFlightLoads, PagedBlockStore, TenantRateLimiter, WholeBlockStore,
-    WorkerObservability, WorkerRuntime,
+    serve_admin, BlockIndex, ConnectionAdmission, InFlightLoads, PagedBlockStore,
+    TenantRateLimiter, WholeBlockStore, WorkerObservability, WorkerRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -52,9 +52,9 @@ use tokio::net::{TcpListener, TcpStream};
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Upper bound on concurrent data-plane connections. Beyond this, new peers wait
-/// for an in-flight connection to finish rather than each spawning an unbounded
-/// task that could pin a payload buffer (issue #111).
+/// Worker-global budget for accepted data-plane connections. Both server paths
+/// acquire before `accept`, so excess peers remain in the kernel backlog instead
+/// of consuming a worker FD or task (issues #111 and #568).
 const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
 
 /// Blocking helper threads per io_uring ring, for the zero-copy `sendfile`
@@ -672,6 +672,8 @@ async fn main() -> anyhow::Result<()> {
              data plane. Performance will be lower under high connection counts."
         );
     }
+    let connection_admission =
+        ConnectionAdmission::new(MAX_DATA_PLANE_CONNECTIONS, observability.metrics().clone());
     #[cfg(target_os = "linux")]
     if !force_tokio && uring_available {
         let rings = talon_worker::uring_serve::resolve_ring_count(cfg.data_plane_rings);
@@ -684,21 +686,18 @@ async fn main() -> anyhow::Result<()> {
         // Tokio worker threads it is handing out — so drive it on a dedicated
         // thread and park this task on the join.
         let addr = cfg.listen.clone();
-        // RingConnHandler is cloned for every ring, and those clones share one
-        // semaphore. Pass the worker-wide budget unchanged: dividing it by the
-        // ring count would accidentally turn the global 1024-connection cap into
-        // a 1024/rings cap for the entire worker (#111).
-        let handler = uring_conn::RingConnHandler::new(
-            Arc::clone(&worker),
-            Arc::clone(&observability),
-            MAX_DATA_PLANE_CONNECTIONS,
-        );
+        // Every SO_REUSEPORT listener shares this worker-global budget. `serve`
+        // acquires it before accept, matching the Tokio fallback and ensuring the
+        // 1024 cap covers accepted socket FDs and their tasks (#568).
+        let handler =
+            uring_conn::RingConnHandler::new(Arc::clone(&worker), Arc::clone(&observability));
         let tokio_handle = tokio::runtime::Handle::current();
         let joined = tokio::task::spawn_blocking(move || {
             talon_worker::uring_serve::serve(
                 addr,
                 rings,
                 URING_BLOCKING_THREADS_PER_RING,
+                connection_admission,
                 handler,
                 tokio_handle,
             )
@@ -709,11 +708,10 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&cfg.listen).await?;
     tracing::info!(listen = %cfg.listen, "worker serving data plane");
-    // Bound concurrent connections so a flood of idle peers cannot exhaust
-    // memory/FDs (issue #111).
-    let conn_limit = talon_transport::ConnectionLimit::new(MAX_DATA_PLANE_CONNECTIONS);
     loop {
-        let permit = conn_limit.acquire().await;
+        // Wait before accept just like each io_uring listener; overload remains
+        // in the kernel backlog and cannot allocate an accepted FD or task.
+        let permit = connection_admission.acquire().await;
         let (stream, peer) = listener.accept().await?;
         let worker = Arc::clone(&worker);
         let observability = Arc::clone(&observability);

@@ -144,6 +144,14 @@ impl ConnectionLimit {
         }
     }
 
+    /// Acquire a permit immediately, or return `None` when the limit is reached.
+    ///
+    /// Callers that wait after `None` can report saturation without racing a
+    /// separate available-permit check.
+    pub fn try_acquire(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.semaphore).try_acquire_owned().ok()
+    }
+
     /// Acquire a permit, waiting if the limit is currently reached. The permit
     /// is released when dropped (i.e. when the connection ends).
     pub async fn acquire(&self) -> OwnedSemaphorePermit {
@@ -224,10 +232,12 @@ mod tests {
     async fn connection_limit_bounds_permits() {
         let limit = ConnectionLimit::new(2);
         assert_eq!(limit.available(), 2);
-        let _p1 = limit.acquire().await;
+        let _p1 = limit.try_acquire().unwrap();
         let _p2 = limit.acquire().await;
         assert_eq!(limit.available(), 0);
+        assert!(limit.try_acquire().is_none());
         drop(_p1);
         assert_eq!(limit.available(), 1);
+        assert!(limit.try_acquire().is_some());
     }
 }

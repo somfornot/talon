@@ -6,6 +6,7 @@
 
 pub mod block_store;
 pub mod capacity;
+pub mod connection_admission;
 mod data_error;
 pub mod eviction;
 mod fd_cache;
@@ -35,6 +36,7 @@ pub mod write_cache;
 
 pub use block_store::WholeBlockStore;
 pub use capacity::{CacheDirConfig, CacheDirs};
+pub use connection_admission::ConnectionAdmission;
 pub use eviction::{CacheUnit, Lru};
 pub use flusher::{FlushOutcome, FlushPolicy, FlushStats, Flusher};
 pub use index::{BlockIndex, Presence};

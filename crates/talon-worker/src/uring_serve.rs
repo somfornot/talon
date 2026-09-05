@@ -29,6 +29,8 @@
 
 use std::sync::Arc;
 
+use crate::ConnectionAdmission;
+
 /// The CPUs this process is actually allowed to run on, in ascending order.
 ///
 /// Reads the thread's affinity mask rather than assuming CPUs are numbered
@@ -125,6 +127,11 @@ pub trait RingHandler: Clone + 'static {
 ///    for `sendfile`,
 /// 3. binds `addr` with `SO_REUSEPORT` and accepts forever.
 ///
+/// Every ring shares `admission`. A ring acquires capacity before `accept`, so
+/// excess peers remain in that listener's kernel backlog without an accepted FD
+/// or Monoio task. The permit moves into the connection task and is released on
+/// every completion, error, or runtime-cancellation path.
+///
 /// `handler` is cloned per ring; share state through an `Arc` inside it.
 ///
 /// # Tokio coexistence
@@ -150,6 +157,7 @@ pub fn serve<H>(
     addr: String,
     rings: usize,
     blocking_threads: usize,
+    admission: ConnectionAdmission,
     handler: H,
     tokio_handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()>
@@ -173,6 +181,7 @@ where
 
     for ring_id in 0..rings {
         let addr = addr.clone();
+        let admission = admission.clone();
         let handler = handler.clone();
         let ready = Arc::clone(&ready);
         let tokio_handle = tokio_handle.clone();
@@ -242,6 +251,10 @@ where
                         tracing::info!(ring = ring_id, %addr, "data-plane ring listening");
 
                         loop {
+                            // Match the Tokio data plane's overload policy: wait
+                            // for worker-global capacity before accepting, leaving
+                            // excess peers in this ring's kernel backlog.
+                            let permit = admission.acquire().await;
                             let (stream, peer) = match listener.accept().await {
                                 Ok(v) => v,
                                 Err(e) => {
@@ -252,6 +265,9 @@ where
                             let _ = stream.set_nodelay(true);
                             let handler = handler.clone();
                             monoio::spawn(async move {
+                                // The permit covers the accepted FD and task for
+                                // their complete lifetime.
+                                let _permit = permit;
                                 if let Err(e) = handler.handle(stream).await {
                                     tracing::debug!(?peer, error = %e, "connection ended");
                                 }
@@ -279,6 +295,10 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    fn admission(capacity: usize) -> ConnectionAdmission {
+        ConnectionAdmission::new(capacity, crate::WorkerMetrics::new(0))
+    }
 
     /// The default configuration must select the io_uring data plane, and it
     /// must be usable on any host CI runs on — the fallback exists precisely so
@@ -459,7 +479,14 @@ mod tests {
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let _ = serve(serve_addr, 4, 2, handler, rt.handle().clone());
+            let _ = serve(
+                serve_addr,
+                4,
+                2,
+                admission(128),
+                handler,
+                rt.handle().clone(),
+            );
         });
 
         // Wait for at least one ring to bind.
@@ -504,7 +531,14 @@ mod tests {
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let _ = serve(serve_addr, 2, 1, handler, rt.handle().clone());
+            let _ = serve(
+                serve_addr,
+                2,
+                1,
+                admission(128),
+                handler,
+                rt.handle().clone(),
+            );
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -521,5 +555,185 @@ mod tests {
         }
         // One shared counter, incremented from whichever ring served.
         await_count(&served, 10);
+    }
+
+    /// Resources held by one synthetic connection handler.
+    struct HandlerResourceGuard {
+        active: Arc<AtomicUsize>,
+        resident_bytes: Arc<AtomicUsize>,
+        bytes: usize,
+    }
+
+    impl Drop for HandlerResourceGuard {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+            self.resident_bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+        }
+    }
+
+    /// An idle handler with deterministic per-task residency. Every admitted
+    /// connection blocks on one byte, then returns an error to exercise permit
+    /// release on the error path.
+    #[derive(Clone)]
+    struct IdleHandler {
+        started: Arc<AtomicUsize>,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        resident_bytes: Arc<AtomicUsize>,
+        bytes_per_connection: usize,
+    }
+
+    impl RingHandler for IdleHandler {
+        async fn handle(&self, mut stream: monoio::net::TcpStream) -> anyhow::Result<()> {
+            let active = self.active.fetch_add(1, Ordering::Relaxed) + 1;
+            self.peak.fetch_max(active, Ordering::Relaxed);
+            self.started.fetch_add(1, Ordering::Relaxed);
+            self.resident_bytes
+                .fetch_add(self.bytes_per_connection, Ordering::Relaxed);
+            let _guard = HandlerResourceGuard {
+                active: Arc::clone(&self.active),
+                resident_bytes: Arc::clone(&self.resident_bytes),
+                bytes: self.bytes_per_connection,
+            };
+            let allocation = vec![0xa5; self.bytes_per_connection];
+            let (result, _) = stream.read_exact(vec![0u8; 1]).await;
+            std::hint::black_box(&allocation);
+            result?;
+            anyhow::bail!("synthetic handler error")
+        }
+    }
+
+    /// Count established sockets owned by this process whose local port is the
+    /// server port. Correlating `/proc/net/tcp` inodes with `/proc/self/fd`
+    /// excludes client-side sockets in this test and connections still queued in
+    /// the kernel backlog.
+    fn accepted_server_fds(port: u16) -> usize {
+        let socket_inodes: HashSet<String> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter_map(|target| {
+                let target = target.to_string_lossy();
+                target
+                    .strip_prefix("socket:[")
+                    .and_then(|value| value.strip_suffix(']'))
+                    .map(str::to_owned)
+            })
+            .collect();
+        let expected_port = format!("{port:04X}");
+        std::fs::read_to_string("/proc/net/tcp")
+            .unwrap()
+            .lines()
+            .skip(1)
+            .filter(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.get(1).is_some_and(|local| {
+                    local
+                        .rsplit_once(':')
+                        .is_some_and(|(_, local_port)| local_port == expected_port)
+                }) && fields.get(3) == Some(&"01")
+                    && fields
+                        .get(9)
+                        .is_some_and(|inode| socket_inodes.contains(*inode))
+            })
+            .count()
+    }
+
+    fn await_zero(counter: &AtomicUsize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while counter.load(Ordering::Relaxed) != 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "counter remained at {}",
+                counter.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Admission happens before both accept and spawn. Excess idle clients stay
+    /// in the kernel backlog, so accepted FDs, handler tasks, and handler-owned
+    /// resident memory all remain bounded by one budget shared across rings.
+    #[test]
+    fn global_admission_bounds_accepts_tasks_and_residency() {
+        const CAPACITY: usize = 2;
+        const CLIENTS: usize = 32;
+        const BYTES_PER_CONNECTION: usize = 256 * 1024;
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket_addr = probe.local_addr().unwrap();
+        let addr = socket_addr.to_string();
+        drop(probe);
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let resident_bytes = Arc::new(AtomicUsize::new(0));
+        let handler = IdleHandler {
+            started: Arc::clone(&started),
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+            resident_bytes: Arc::clone(&resident_bytes),
+            bytes_per_connection: BYTES_PER_CONNECTION,
+        };
+        let metrics = crate::WorkerMetrics::new(0);
+        let connection_admission = ConnectionAdmission::new(CAPACITY, metrics.clone());
+        let serve_addr = addr.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _ = serve(
+                serve_addr,
+                2,
+                1,
+                connection_admission,
+                handler,
+                rt.handle().clone(),
+            );
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let first = loop {
+            match std::net::TcpStream::connect(&addr) {
+                Ok(stream) => break stream,
+                Err(_) => {
+                    assert!(std::time::Instant::now() < deadline, "rings never bound");
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        };
+        let mut clients = Vec::with_capacity(CLIENTS);
+        clients.push(first);
+        for _ in 1..CLIENTS {
+            clients.push(std::net::TcpStream::connect(&addr).unwrap());
+        }
+
+        await_count(&started, CAPACITY);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(started.load(Ordering::Relaxed), CAPACITY);
+        assert_eq!(active.load(Ordering::Relaxed), CAPACITY);
+        assert_eq!(peak.load(Ordering::Relaxed), CAPACITY);
+        assert_eq!(
+            resident_bytes.load(Ordering::Relaxed),
+            CAPACITY * BYTES_PER_CONNECTION
+        );
+        assert_eq!(accepted_server_fds(socket_addr.port()), CAPACITY);
+        let saturation = metrics
+            .render()
+            .lines()
+            .find(|line| line.starts_with("talon_worker_connection_admission_saturated_total "))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap();
+        assert!(saturation > 0);
+
+        // Every error completion releases its permit, allowing all queued peers
+        // to enter without ever exceeding the peak.
+        for client in &mut clients {
+            std::io::Write::write_all(client, b"x").unwrap();
+        }
+        await_count(&started, CLIENTS);
+        await_zero(&active);
+        assert_eq!(peak.load(Ordering::Relaxed), CAPACITY);
+        assert_eq!(resident_bytes.load(Ordering::Relaxed), 0);
     }
 }

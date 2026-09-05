@@ -841,40 +841,26 @@ async fn handle_delete(
 }
 
 /// Adapts [`handle_conn`] to the ring runtime's [`crate::uring_serve::RingHandler`]
-/// trait.
-///
-/// Carries the shared worker state and enforces the same worker-wide connection
-/// cap as the Tokio path (#111). [`RingConnHandler`] is cloned once per ring, and
-/// every clone shares the same semaphore, so callers must pass the global budget
-/// unchanged.
+/// trait. Connection admission belongs to the server accept loop; this handler
+/// owns only protocol state.
 #[derive(Clone)]
 pub struct RingConnHandler {
     worker: Arc<WorkerRuntime>,
     observability: Arc<WorkerObservability>,
-    limit: Arc<tokio::sync::Semaphore>,
 }
 
 impl RingConnHandler {
-    /// Build a handler admitting at most `max_connections` concurrent
-    /// connections across all rings that share its clones.
-    pub fn new(
-        worker: Arc<WorkerRuntime>,
-        observability: Arc<WorkerObservability>,
-        global_max_connections: usize,
-    ) -> Self {
+    /// Build a protocol handler for an already-admitted connection.
+    pub fn new(worker: Arc<WorkerRuntime>, observability: Arc<WorkerObservability>) -> Self {
         Self {
             worker,
             observability,
-            limit: Arc::new(tokio::sync::Semaphore::new(global_max_connections)),
         }
     }
 }
 
 impl crate::uring_serve::RingHandler for RingConnHandler {
     async fn handle(&self, stream: TcpStream) -> anyhow::Result<()> {
-        // Acquire before serving and hold for the connection's lifetime, so a
-        // flood of idle peers cannot exhaust memory or file descriptors.
-        let _permit = self.limit.clone().acquire_owned().await?;
         handle_conn(
             stream,
             Arc::clone(&self.worker),
@@ -1419,38 +1405,8 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// `serve` clones one handler per io_uring ring. The semaphore deliberately
-    /// remains worker-wide across those clones, so main must pass the global
-    /// connection budget rather than dividing it by the number of rings.
-    #[test]
-    fn ring_handler_clones_share_one_global_connection_budget() {
-        let root = tmp_root("ring-global-limit");
-        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let (worker, obs) = {
-            let _guard = tokio_rt.enter();
-            build(&root, Arc::new(RampBackend), 16)
-        };
-
-        let handler = RingConnHandler::new(worker, obs, 3);
-        let clone = handler.clone();
-        assert!(Arc::ptr_eq(&handler.limit, &clone.limit));
-
-        let permits: Vec<_> = (0..3)
-            .map(|_| handler.limit.clone().try_acquire_owned().unwrap())
-            .collect();
-        assert!(clone.limit.clone().try_acquire_owned().is_err());
-
-        drop(permits);
-        assert!(clone.limit.clone().try_acquire_owned().is_ok());
-        std::fs::remove_dir_all(root).ok();
-    }
-
-    /// The RingConnHandler admits up to its cap and serves real traffic through
-    /// the ring runtime — the wiring main.rs uses.
+    /// The RingConnHandler serves real traffic through the ring runtime — the
+    /// wiring main.rs uses.
     #[test]
     fn ring_handler_serves_through_the_ring_runtime() {
         use crate::uring_serve::serve;
@@ -1470,11 +1426,12 @@ mod tests {
         let addr = probe.local_addr().unwrap().to_string();
         drop(probe);
 
-        let handler = RingConnHandler::new(worker, obs, 8);
+        let admission = crate::ConnectionAdmission::new(8, obs.metrics().clone());
+        let handler = RingConnHandler::new(worker, obs);
         let handle = tokio_rt.handle().clone();
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
-            let _ = serve(serve_addr, 2, 2, handler, handle);
+            let _ = serve(serve_addr, 2, 2, admission, handler, handle);
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

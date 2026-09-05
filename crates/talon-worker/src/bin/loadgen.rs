@@ -10,9 +10,10 @@
 //! about the regime a cache fleet actually runs in.
 //!
 //! This binary opens N connections, drives closed-loop range requests on each
-//! for a fixed duration, and reports the **latency distribution** plus
-//! server-side CPU and RSS. It is a manual tool for a known machine, not a CI
-//! gate: shared runners are too noisy for absolute-time comparisons.
+//! for a fixed duration, and reports TCP-connected versus actually served
+//! connections, the **latency distribution**, and server-side CPU, FD, and RSS
+//! usage. It is a manual tool for a known machine, not a CI gate: shared runners
+//! are too noisy for absolute-time comparisons.
 //!
 //! # Usage
 //!
@@ -68,7 +69,7 @@ struct Args {
     /// Container or bucket the object lives in.
     #[arg(long, default_value = "c")]
     container: String,
-    /// Worker PID to sample CPU and RSS from. Skipped when unset.
+    /// Worker PID to sample CPU, open FDs, and RSS from. Skipped when unset.
     #[arg(long)]
     server_pid: Option<u32>,
     /// Emit JSON Lines instead of a table, for scripted comparison.
@@ -88,9 +89,19 @@ struct Args {
     depth: usize,
 }
 
+/// Per-run connection progress shared by client tasks.
+#[derive(Default)]
+struct RunProgress {
+    connected: AtomicU64,
+    served: AtomicU64,
+    errors: AtomicU64,
+}
+
 /// One connection count's result.
 struct Run {
     conns: usize,
+    connected_conns: u64,
+    served_conns: u64,
     rps: f64,
     p50: f64,
     p90: f64,
@@ -99,6 +110,7 @@ struct Run {
     max: f64,
     samples: usize,
     cpu_percent: Option<f64>,
+    server_fds: Option<usize>,
     rss_kb: Option<u64>,
 }
 
@@ -125,6 +137,10 @@ fn proc_rss_kb(pid: u32) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+fn proc_fd_count(pid: u32) -> Option<usize> {
+    Some(std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?.count())
+}
+
 /// Drive one connection closed-loop until `stop`, returning post-warmup
 /// latencies in nanoseconds.
 #[allow(clippy::too_many_arguments)]
@@ -134,7 +150,7 @@ async fn drive_one(
     range: u64,
     warmup: Duration,
     stop: Arc<AtomicBool>,
-    errors: Arc<AtomicU64>,
+    progress: Arc<RunProgress>,
     offset_seed: u64,
     depth: usize,
 ) -> Vec<u64> {
@@ -145,16 +161,19 @@ async fn drive_one(
             range,
             warmup,
             stop,
-            errors,
+            progress,
             offset_seed,
             depth,
         )
         .await;
     }
     let mut sock = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
+        Ok(s) => {
+            progress.connected.fetch_add(1, Ordering::Relaxed);
+            s
+        }
         Err(_) => {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             return Vec::new();
         }
     };
@@ -167,6 +186,7 @@ async fn drive_one(
     let mut offset = (offset_seed * range) % (16 << 20);
     let started = Instant::now();
     let mut recording = false;
+    let mut served = false;
 
     while !stop.load(Ordering::Relaxed) {
         if !recording && started.elapsed() >= warmup {
@@ -184,29 +204,42 @@ async fn drive_one(
 
         let t0 = Instant::now();
         if sock.write_all(&encoded).await.is_err() {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             break;
         }
         if sock.read_exact(&mut header_buf).await.is_err() {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             break;
         }
         let Ok(header) = FrameHeader::decode(&header_buf) else {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             break;
         };
+        if header.request_id != 0 {
+            if progress.errors.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "reply for unknown request_id {}: expected 0",
+                    header.request_id
+                );
+            }
+            break;
+        }
         let len = header.length as usize;
         if len > body.len() {
             body.resize(len, 0);
         }
         if len > 0 && sock.read_exact(&mut body[..len]).await.is_err() {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             break;
+        }
+        if !served {
+            progress.served.fetch_add(1, Ordering::Relaxed);
+            served = true;
         }
         // An ERROR-flagged response is a served request but not a served read;
         // count it so a misconfigured run cannot look like a fast one.
         if header.flags.contains(talon_transport::Flags::ERROR) {
-            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
+            if progress.errors.fetch_add(1, Ordering::Relaxed) == 0 {
                 // Surface the first error verbatim: a misconfigured run is far
                 // more likely than a server bug, and the message says which.
                 eprintln!(
@@ -243,14 +276,17 @@ async fn drive_one_pipelined(
     range: u64,
     warmup: Duration,
     stop: Arc<AtomicBool>,
-    errors: Arc<AtomicU64>,
+    progress: Arc<RunProgress>,
     offset_seed: u64,
     depth: usize,
 ) -> Vec<u64> {
     let sock = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
+        Ok(s) => {
+            progress.connected.fetch_add(1, Ordering::Relaxed);
+            s
+        }
         Err(_) => {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             return Vec::new();
         }
     };
@@ -268,7 +304,7 @@ async fn drive_one_pipelined(
     let done = Arc::new(AtomicBool::new(false));
     let writer_stop = Arc::clone(&stop);
     let writer_done = Arc::clone(&done);
-    let writer_errors = Arc::clone(&errors);
+    let writer_progress = Arc::clone(&progress);
     let writer = tokio::spawn(async move {
         let mut offset = (offset_seed * range) % (16 << 20);
         let mut next_id: u32 = 1;
@@ -299,7 +335,7 @@ async fn drive_one_pipelined(
                 break;
             }
             if wr.write_all(&encoded).await.is_err() {
-                writer_errors.fetch_add(1, Ordering::Relaxed);
+                writer_progress.errors.fetch_add(1, Ordering::Relaxed);
                 break;
             }
             window += 1;
@@ -313,6 +349,7 @@ async fn drive_one_pipelined(
     let mut header_buf = [0u8; HEADER_LEN];
     let started = Instant::now();
     let mut recording = false;
+    let mut served = false;
     // Sent-but-unanswered requests, keyed by the id echoed in the reply header.
     let mut pending: HashMap<u32, Instant> = HashMap::with_capacity(depth * 2);
 
@@ -338,11 +375,11 @@ async fn drive_one_pipelined(
             pending.insert(id, t0);
         }
         if rd.read_exact(&mut header_buf).await.is_err() {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             break;
         }
         let Ok(header) = FrameHeader::decode(&header_buf) else {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             break;
         };
         let len = header.length as usize;
@@ -350,7 +387,7 @@ async fn drive_one_pipelined(
             body.resize(len, 0);
         }
         if len > 0 && rd.read_exact(&mut body[..len]).await.is_err() {
-            errors.fetch_add(1, Ordering::Relaxed);
+            progress.errors.fetch_add(1, Ordering::Relaxed);
             break;
         }
         // Out-of-order replies are expected from a multiplexing worker. The id
@@ -371,7 +408,7 @@ async fn drive_one_pipelined(
             }
         };
         let Some(t0) = t0 else {
-            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
+            if progress.errors.fetch_add(1, Ordering::Relaxed) == 0 {
                 eprintln!(
                     "reply for unknown request_id {}: never sent on this connection",
                     header.request_id
@@ -379,18 +416,12 @@ async fn drive_one_pipelined(
             }
             break;
         };
-        if header.flags.contains(talon_transport::Flags::ERROR) {
-            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
-                eprintln!(
-                    "first error response: {}",
-                    String::from_utf8_lossy(&body[..len])
-                );
-            }
-        } else if recording {
-            latencies.push(t0.elapsed().as_nanos() as u64);
+        if !served {
+            progress.served.fetch_add(1, Ordering::Relaxed);
+            served = true;
         }
         if header.flags.contains(talon_transport::Flags::ERROR) {
-            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
+            if progress.errors.fetch_add(1, Ordering::Relaxed) == 0 {
                 eprintln!(
                     "first error response: {}",
                     String::from_utf8_lossy(&body[..len])
@@ -416,7 +447,7 @@ async fn drive_one_pipelined(
 async fn run_one(args: &Args, conns: usize) -> Run {
     let object = ObjectId::new(args.backend, &args.container, &args.object);
     let stop = Arc::new(AtomicBool::new(false));
-    let errors = Arc::new(AtomicU64::new(0));
+    let progress = Arc::new(RunProgress::default());
     let warmup = Duration::from_secs(args.warmup);
 
     let mut tasks = Vec::with_capacity(conns);
@@ -427,7 +458,7 @@ async fn run_one(args: &Args, conns: usize) -> Run {
             args.range,
             warmup,
             Arc::clone(&stop),
-            Arc::clone(&errors),
+            Arc::clone(&progress),
             i as u64,
             args.depth.max(1),
         )));
@@ -441,7 +472,12 @@ async fn run_one(args: &Args, conns: usize) -> Run {
     tokio::time::sleep(Duration::from_secs(args.seconds)).await;
     let measured = measure_start.elapsed();
     let cpu_after = args.server_pid.and_then(proc_cpu_jiffies);
+    let server_fds = args.server_pid.and_then(proc_fd_count);
     let rss_kb = args.server_pid.and_then(proc_rss_kb);
+    // Snapshot admission before stopping clients. Connections released while the
+    // tasks drain must not make an over-capacity run look fully served.
+    let connected_conns = progress.connected.load(Ordering::Relaxed);
+    let served_conns = progress.served.load(Ordering::Relaxed);
     stop.store(true, Ordering::Relaxed);
 
     let mut all: Vec<u64> = Vec::new();
@@ -467,13 +503,15 @@ async fn run_one(args: &Args, conns: usize) -> Run {
         _ => None,
     };
 
-    let errs = errors.load(Ordering::Relaxed);
+    let errs = progress.errors.load(Ordering::Relaxed);
     if errs > 0 {
         eprintln!("warning: {errs} errored requests at {conns} connections");
     }
 
     Run {
         conns,
+        connected_conns,
+        served_conns,
         rps: all.len() as f64 / measured.as_secs_f64(),
         p50: pct(0.50),
         p90: pct(0.90),
@@ -482,6 +520,7 @@ async fn run_one(args: &Args, conns: usize) -> Run {
         max: all.last().copied().unwrap_or(0) as f64 / 1000.0,
         samples: all.len(),
         cpu_percent,
+        server_fds,
         rss_kb,
     }
 }
@@ -495,18 +534,31 @@ async fn main() -> anyhow::Result<()> {
             args.addr, args.range, args.seconds, args.warmup
         );
         println!(
-            "{:>6} {:>12} {:>9} {:>9} {:>9} {:>9} {:>10} {:>7} {:>8}",
-            "conns", "rps", "p50 us", "p90 us", "p99 us", "p999 us", "max us", "cpu %", "rss MB"
+            "{:>6} {:>9} {:>8} {:>12} {:>9} {:>9} {:>9} {:>9} {:>10} {:>7} {:>7} {:>8}",
+            "conns",
+            "connected",
+            "served",
+            "rps",
+            "p50 us",
+            "p90 us",
+            "p99 us",
+            "p999 us",
+            "max us",
+            "cpu %",
+            "fds",
+            "rss MB"
         );
-        println!("{}", "-".repeat(90));
+        println!("{}", "-".repeat(112));
     }
 
     for &conns in &args.conns {
         let run = run_one(&args, conns).await;
         if args.json {
             println!(
-                r#"{{"conns":{},"rps":{:.0},"p50_us":{:.1},"p90_us":{:.1},"p99_us":{:.1},"p999_us":{:.1},"max_us":{:.1},"samples":{},"cpu_percent":{},"rss_kb":{}}}"#,
+                r#"{{"conns":{},"connected_conns":{},"served_conns":{},"rps":{:.0},"p50_us":{:.1},"p90_us":{:.1},"p99_us":{:.1},"p999_us":{:.1},"max_us":{:.1},"samples":{},"cpu_percent":{},"server_fds":{},"rss_kb":{}}}"#,
                 run.conns,
+                run.connected_conns,
+                run.served_conns,
                 run.rps,
                 run.p50,
                 run.p90,
@@ -517,14 +569,19 @@ async fn main() -> anyhow::Result<()> {
                 run.cpu_percent
                     .map(|c| format!("{c:.1}"))
                     .unwrap_or_else(|| "null".into()),
+                run.server_fds
+                    .map(|fds| fds.to_string())
+                    .unwrap_or_else(|| "null".into()),
                 run.rss_kb
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "null".into()),
             );
         } else {
             println!(
-                "{:>6} {:>12.0} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>10.1} {:>7} {:>8}",
+                "{:>6} {:>9} {:>8} {:>12.0} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>10.1} {:>7} {:>7} {:>8}",
                 run.conns,
+                run.connected_conns,
+                run.served_conns,
                 run.rps,
                 run.p50,
                 run.p90,
@@ -533,6 +590,9 @@ async fn main() -> anyhow::Result<()> {
                 run.max,
                 run.cpu_percent
                     .map(|c| format!("{c:.0}"))
+                    .unwrap_or_else(|| "-".into()),
+                run.server_fds
+                    .map(|fds| fds.to_string())
                     .unwrap_or_else(|| "-".into()),
                 run.rss_kb
                     .map(|r| format!("{:.1}", r as f64 / 1024.0))

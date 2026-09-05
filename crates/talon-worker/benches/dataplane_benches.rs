@@ -227,10 +227,11 @@ fn spawn_uring_server(
     let addr = probe.local_addr().unwrap().to_string();
     drop(probe);
 
-    let h = talon_worker::uring_conn::RingConnHandler::new(runtime, observability, 128);
+    let admission = talon_worker::ConnectionAdmission::new(128, observability.metrics().clone());
+    let h = talon_worker::uring_conn::RingConnHandler::new(runtime, observability);
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
-        let _ = talon_worker::uring_serve::serve(serve_addr, 1, 4, h, handle);
+        let _ = talon_worker::uring_serve::serve(serve_addr, 1, 4, admission, h, handle);
     });
 
     // Wait for the ring to bind before the harness starts timing.

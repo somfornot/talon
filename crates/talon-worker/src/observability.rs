@@ -28,6 +28,7 @@ pub struct WorkerMetrics {
     registry: Metrics,
     configured_capacity_bytes: u64,
     active_connection_count: Arc<AtomicU64>,
+    connection_admission_saturated_total: Counter,
     requests_total: Counter,
     request_errors_total: Counter,
     bytes_served_total: Counter,
@@ -52,6 +53,7 @@ pub struct WorkerMetrics {
     heartbeat_failure_total: Counter,
     request_duration_seconds: Histogram,
     backend_fetch_duration_seconds: Histogram,
+    connection_capacity: Gauge,
     active_connections: Gauge,
     inflight_loads: Gauge,
     block_count: Gauge,
@@ -93,6 +95,11 @@ impl WorkerMetrics {
             )
             .set(1.0);
         let active_connection_count = Arc::new(AtomicU64::new(0));
+        let connection_admission_saturated_total = registry.counter(
+            "talon_worker_connection_admission_saturated_total",
+            "Accept-loop waits caused by the worker-global data-plane connection budget being full.",
+            BTreeMap::new(),
+        );
         let requests_total = registry.counter(
             "talon_worker_requests_total",
             "Data-plane requests completed by the worker.",
@@ -213,9 +220,14 @@ impl WorkerMetrics {
             "Origin backend range fetch latency in seconds.",
             backend_labels,
         );
+        let connection_capacity = registry.gauge(
+            "talon_worker_connection_capacity",
+            "Configured worker-global data-plane connection capacity.",
+            BTreeMap::new(),
+        );
         let active_connections = registry.gauge(
             "talon_worker_active_connections",
-            "Data-plane connections currently open.",
+            "Accepted data-plane connections currently being served.",
             BTreeMap::new(),
         );
         let inflight_loads = registry.gauge(
@@ -274,6 +286,7 @@ impl WorkerMetrics {
             registry,
             configured_capacity_bytes,
             active_connection_count,
+            connection_admission_saturated_total,
             requests_total,
             request_errors_total,
             bytes_served_total,
@@ -298,6 +311,7 @@ impl WorkerMetrics {
             heartbeat_failure_total,
             request_duration_seconds,
             backend_fetch_duration_seconds,
+            connection_capacity,
             active_connections,
             inflight_loads,
             block_count,
@@ -475,6 +489,16 @@ impl WorkerMetrics {
     /// Record a completed cache eviction.
     pub fn record_eviction(&self) {
         self.evictions_total.inc();
+    }
+
+    /// Publish the worker-global data-plane connection capacity.
+    pub fn set_connection_capacity(&self, capacity: usize) {
+        self.connection_capacity.set(capacity as f64);
+    }
+
+    /// Record an accept loop waiting for connection capacity.
+    pub fn record_connection_admission_saturation(&self) {
+        self.connection_admission_saturated_total.inc();
     }
 
     /// Increment active connections until the returned guard is dropped.
@@ -880,6 +904,17 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn connection_admission_metrics_report_capacity_and_saturation() {
+        let metrics = WorkerMetrics::new(4096);
+        metrics.set_connection_capacity(1024);
+        metrics.record_connection_admission_saturation();
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("talon_worker_connection_capacity 1024"));
+        assert!(rendered.contains("talon_worker_connection_admission_saturated_total 1"));
     }
 
     #[test]
