@@ -684,14 +684,14 @@ async fn main() -> anyhow::Result<()> {
         // Tokio worker threads it is handing out — so drive it on a dedicated
         // thread and park this task on the join.
         let addr = cfg.listen.clone();
-        // The cap is per ring, so divide the global budget across them; the
-        // total admitted stays MAX_DATA_PLANE_CONNECTIONS regardless of how many
-        // rings are configured (#111).
-        let per_ring_connections = MAX_DATA_PLANE_CONNECTIONS.div_ceil(rings).max(1);
+        // RingConnHandler is cloned for every ring, and those clones share one
+        // semaphore. Pass the worker-wide budget unchanged: dividing it by the
+        // ring count would accidentally turn the global 1024-connection cap into
+        // a 1024/rings cap for the entire worker (#111).
         let handler = uring_conn::RingConnHandler::new(
             Arc::clone(&worker),
             Arc::clone(&observability),
-            per_ring_connections,
+            MAX_DATA_PLANE_CONNECTIONS,
         );
         let tokio_handle = tokio::runtime::Handle::current();
         let joined = tokio::task::spawn_blocking(move || {

@@ -843,10 +843,10 @@ async fn handle_delete(
 /// Adapts [`handle_conn`] to the ring runtime's [`crate::uring_serve::RingHandler`]
 /// trait.
 ///
-/// Carries the shared worker state and enforces the same connection cap as the
-/// Tokio path (#111). The cap is **per ring**, not global: each ring owns an
-/// independent semaphore, so N rings admit `N * max_connections` in total.
-/// Callers should divide the global budget by the ring count.
+/// Carries the shared worker state and enforces the same worker-wide connection
+/// cap as the Tokio path (#111). [`RingConnHandler`] is cloned once per ring, and
+/// every clone shares the same semaphore, so callers must pass the global budget
+/// unchanged.
 #[derive(Clone)]
 pub struct RingConnHandler {
     worker: Arc<WorkerRuntime>,
@@ -856,16 +856,16 @@ pub struct RingConnHandler {
 
 impl RingConnHandler {
     /// Build a handler admitting at most `max_connections` concurrent
-    /// connections on the ring that owns it.
+    /// connections across all rings that share its clones.
     pub fn new(
         worker: Arc<WorkerRuntime>,
         observability: Arc<WorkerObservability>,
-        max_connections: usize,
+        global_max_connections: usize,
     ) -> Self {
         Self {
             worker,
             observability,
-            limit: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+            limit: Arc::new(tokio::sync::Semaphore::new(global_max_connections)),
         }
     }
 }
@@ -1416,6 +1416,36 @@ mod tests {
             drop(c);
             assert!(served.await.is_ok());
         });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `serve` clones one handler per io_uring ring. The semaphore deliberately
+    /// remains worker-wide across those clones, so main must pass the global
+    /// connection budget rather than dividing it by the number of rings.
+    #[test]
+    fn ring_handler_clones_share_one_global_connection_budget() {
+        let root = tmp_root("ring-global-limit");
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (worker, obs) = {
+            let _guard = tokio_rt.enter();
+            build(&root, Arc::new(RampBackend), 16)
+        };
+
+        let handler = RingConnHandler::new(worker, obs, 3);
+        let clone = handler.clone();
+        assert!(Arc::ptr_eq(&handler.limit, &clone.limit));
+
+        let permits: Vec<_> = (0..3)
+            .map(|_| handler.limit.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert!(clone.limit.clone().try_acquire_owned().is_err());
+
+        drop(permits);
+        assert!(clone.limit.clone().try_acquire_owned().is_ok());
         std::fs::remove_dir_all(root).ok();
     }
 
