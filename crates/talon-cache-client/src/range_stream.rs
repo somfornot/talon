@@ -109,6 +109,9 @@ impl From<DetailedBlockReadError> for CacheReadError {
             DetailedBlockReadError::Worker(error) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Coordinator(error)) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Worker(error)) => error.into(),
+            DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed { source, .. }) => {
+                source.into()
+            }
             DetailedBlockReadError::Block(error) => Self::Unavailable(error.to_string()),
         }
     }
@@ -394,6 +397,32 @@ mod tests {
             CacheReadError::from(error),
             CacheReadError::Timeout(_)
         ));
+    }
+
+    #[test]
+    fn exhausted_replicas_preserve_stream_error_classification() {
+        for code in [DataErrorCode::Timeout, DataErrorCode::Internal] {
+            let error = DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {
+                worker: "127.0.0.1:1234".into(),
+                source: WorkerError::Remote(DataPlaneError {
+                    code,
+                    message: "original worker diagnostic".into(),
+                }),
+            });
+            let error = CacheReadError::from(error);
+            assert!(error.to_string().contains("original worker diagnostic"));
+            match code {
+                DataErrorCode::Timeout => {
+                    assert!(error.fallback_eligible());
+                    assert!(matches!(error, CacheReadError::Timeout(_)));
+                }
+                DataErrorCode::Internal => {
+                    assert!(!error.fallback_eligible());
+                    assert!(matches!(error, CacheReadError::Internal(_)));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
