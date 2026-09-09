@@ -127,3 +127,26 @@ reuse without leaking a permit.
   consistency checks passed again after integration.
 - The original benchmark artifact and historical validation records are retained
   unchanged; production performance and PromQL validation limitations still apply.
+
+## CI alert contract repair (2026-09-09)
+
+PR #580's initial `test` job failed three `talon-observability` tests: new alert
+metric names were absent from the contract list, and their runbook URLs did not
+target headings in `docs/operations/runbook.md`. The earlier core/worker-only
+test runs did not execute this crate's tests; YAML parsing and workspace
+compilation did not catch these contract violations.
+
+All three failures were reproduced locally. The repair registers the 12 alert
+metric names after checking their worker exporters and adds operational runbook
+sections for all five page maintenance alerts, preserving the existing tests.
+
+- `cargo test -p talon-observability --all-features --locked`: 17 tests passed.
+- The CI test command, `cargo test --workspace --exclude talon-python
+  --all-features --locked`, passed locally: 1,306 passed and 22 ignored, with
+  localhost proxy bypass and socket/io_uring permissions. This includes unit,
+  integration and doc tests;
+  opt-in external-service tests and manual probes remain ignored.
+- `cargo clippy -p talon-observability --all-targets --all-features --locked --
+  -D warnings`, formatting and diff whitespace checks passed.
+
+PromQL execution with `promtool` and production performance remain unvalidated.
