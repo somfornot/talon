@@ -210,27 +210,33 @@ impl WorkerClient {
         // Allocate a correlation id and put it on the wire, so the worker's
         // logs for this fetch can be joined with the client's (#304).
         let req_id = RequestId::next();
-        let out = self.encode_range_request(req_id.0, req)?;
+        let mut out = self.encode_range_request(req_id.0, req)?;
         // Try a pooled connection first; if it was reused and fails with an I/O
         // error (the peer may have closed it while idle), retry once on a fresh
         // dial so a stale pooled socket never turns a healthy peer into a
         // spurious failure. A failure on a fresh connection, or a non-I/O error
         // on a reused one (the peer answered but refused/rejected the request),
         // propagates immediately rather than re-asking the same peer.
-        match self.exchange(&out, len).await {
+        match self.exchange(&mut out, len).await {
             Ok(bytes) => Ok(bytes),
             Err((true, err)) if err.is_transport_failure() => {
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                let bytes = self
-                    .pool
-                    .with_request_deadline("worker fetch_range retry", async {
-                        stream.write_all(&out).await?;
-                        stream.flush().await?;
-                        read_range_reply(&mut stream, len).await
-                    })
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(bytes)
+                talon_telemetry::observe("talon.rpc", "client", async {
+                    talon_telemetry::text("server.address", &self.addr);
+                    talon_transport::envelope::outbound(&mut out, &self.addr)?;
+
+                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let bytes = self
+                        .pool
+                        .with_request_deadline("worker fetch_range retry", async {
+                            stream.write_all(&out).await?;
+                            stream.flush().await?;
+                            read_range_reply(&mut stream, len).await
+                        })
+                        .await?;
+                    self.pool.release(&self.addr, stream);
+                    Ok(bytes)
+                })
+                .await
             }
             Err((_, err)) => {
                 tracing::error!(
@@ -263,21 +269,27 @@ impl WorkerClient {
             len: dst.len() as u64,
         };
         let request_id = RequestId::next();
-        let output = self.encode_range_request(request_id.0, request)?;
-        match self.exchange_into(&output, dst).await {
+        let mut output = self.encode_range_request(request_id.0, request)?;
+        match self.exchange_into(&mut output, dst).await {
             Ok(n) => Ok(n),
             Err((true, err)) if err.is_transport_failure() => {
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                let n = self
-                    .pool
-                    .with_request_deadline("worker fetch_range retry", async {
-                        stream.write_all(&output).await?;
-                        stream.flush().await?;
-                        read_range_reply_into(&mut stream, dst).await
-                    })
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(n)
+                talon_telemetry::observe("talon.rpc", "client", async {
+                    talon_telemetry::text("server.address", &self.addr);
+                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+
+                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let n = self
+                        .pool
+                        .with_request_deadline("worker fetch_range retry", async {
+                            stream.write_all(&output).await?;
+                            stream.flush().await?;
+                            read_range_reply_into(&mut stream, dst).await
+                        })
+                        .await?;
+                    self.pool.release(&self.addr, stream);
+                    Ok(n)
+                })
+                .await
             }
             Err((_, error)) => {
                 tracing::error!(
@@ -312,21 +324,27 @@ impl WorkerClient {
             len,
         };
         let request_id = RequestId::next();
-        let output = self.encode_cached_range_request(request_id.0, request)?;
-        match self.exchange(&output, len).await {
+        let mut output = self.encode_cached_range_request(request_id.0, request)?;
+        match self.exchange(&mut output, len).await {
             Ok(bytes) => Ok(bytes),
             Err((true, err)) if err.is_transport_failure() => {
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                let bytes = self
-                    .pool
-                    .with_request_deadline("worker fetch_cached_range retry", async {
-                        stream.write_all(&output).await?;
-                        stream.flush().await?;
-                        read_range_reply(&mut stream, len).await
-                    })
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(bytes)
+                talon_telemetry::observe("talon.rpc", "client", async {
+                    talon_telemetry::text("server.address", &self.addr);
+                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+
+                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let bytes = self
+                        .pool
+                        .with_request_deadline("worker fetch_cached_range retry", async {
+                            stream.write_all(&output).await?;
+                            stream.flush().await?;
+                            read_range_reply(&mut stream, len).await
+                        })
+                        .await?;
+                    self.pool.release(&self.addr, stream);
+                    Ok(bytes)
+                })
+                .await
             }
             Err((_, error)) => Err(error),
         }
@@ -378,6 +396,7 @@ impl WorkerClient {
             .checkout(&self.addr)
             .await
             .map_err(|error| (false, WorkerError::from(error)))?;
+        talon_telemetry::record("talon.pool.reused", reused as u64);
         let result = self
             .pool
             .with_deadline(
@@ -407,59 +426,75 @@ impl WorkerClient {
     /// connection may simply have been closed while idle).
     async fn exchange(
         &self,
-        out: &[u8],
+        out: &mut Vec<u8>,
         expected_len: u64,
     ) -> Result<Vec<u8>, (bool, WorkerError)> {
-        let (mut stream, reused) = self
-            .pool
-            .checkout(&self.addr)
-            .await
-            .map_err(|e| (false, WorkerError::from(e)))?;
-        // On any error, `stream` is dropped (not released), so a half-broken
-        // connection is never returned to the pool.
-        let result: Result<Vec<u8>, WorkerError> = self
-            .pool
-            .with_request_deadline("worker fetch_range", async {
-                stream.write_all(out).await?;
-                stream.flush().await?;
-                read_range_reply(&mut stream, expected_len).await
-            })
-            .await;
-        match result {
-            Ok(bytes) => {
-                self.pool.release(&self.addr, stream);
-                Ok(bytes)
+        talon_telemetry::observe("talon.rpc", "client", async {
+            talon_telemetry::text("server.address", &self.addr);
+            talon_transport::envelope::outbound(out, &self.addr)
+                .map_err(|e| (false, WorkerError::Frame(e)))?;
+
+            let (mut stream, reused) = self
+                .pool
+                .checkout(&self.addr)
+                .await
+                .map_err(|e| (false, WorkerError::from(e)))?;
+            talon_telemetry::record("talon.pool.reused", reused as u64);
+            // On any error, `stream` is dropped (not released), so a half-broken
+            // connection is never returned to the pool.
+            let result: Result<Vec<u8>, WorkerError> = self
+                .pool
+                .with_request_deadline("worker fetch_range", async {
+                    stream.write_all(out).await?;
+                    stream.flush().await?;
+                    read_range_reply(&mut stream, expected_len).await
+                })
+                .await;
+            match result {
+                Ok(bytes) => {
+                    self.pool.release(&self.addr, stream);
+                    Ok(bytes)
+                }
+                Err(err) => Err((reused, err)),
             }
-            Err(err) => Err((reused, err)),
-        }
+        })
+        .await
     }
 
     /// One request/response into a caller-owned buffer.
     async fn exchange_into(
         &self,
-        output: &[u8],
+        output: &mut Vec<u8>,
         dst: &mut [u8],
     ) -> Result<usize, (bool, WorkerError)> {
-        let (mut stream, reused) = self
-            .pool
-            .checkout(&self.addr)
-            .await
-            .map_err(|error| (false, WorkerError::from(error)))?;
-        let result: Result<usize, WorkerError> = self
-            .pool
-            .with_request_deadline("worker fetch_range", async {
-                stream.write_all(output).await?;
-                stream.flush().await?;
-                read_range_reply_into(&mut stream, dst).await
-            })
-            .await;
-        match result {
-            Ok(n) => {
-                self.pool.release(&self.addr, stream);
-                Ok(n)
+        talon_telemetry::observe("talon.rpc", "client", async {
+            talon_telemetry::text("server.address", &self.addr);
+            talon_transport::envelope::outbound(output, &self.addr)
+                .map_err(|e| (false, WorkerError::Frame(e)))?;
+
+            let (mut stream, reused) = self
+                .pool
+                .checkout(&self.addr)
+                .await
+                .map_err(|error| (false, WorkerError::from(error)))?;
+            talon_telemetry::record("talon.pool.reused", reused as u64);
+            let result: Result<usize, WorkerError> = self
+                .pool
+                .with_request_deadline("worker fetch_range", async {
+                    stream.write_all(output).await?;
+                    stream.flush().await?;
+                    read_range_reply_into(&mut stream, dst).await
+                })
+                .await;
+            match result {
+                Ok(n) => {
+                    self.pool.release(&self.addr, stream);
+                    Ok(n)
+                }
+                Err(error) => Err((reused, error)),
             }
-            Err(error) => Err((reused, error)),
-        }
+        })
+        .await
     }
 }
 

@@ -37,3 +37,5 @@ pub use limits::{
     MAX_CONTROL_PAYLOAD_LEN,
 };
 pub use pool::{Channel, CheckoutError, Connector, Pool, PoolConfig};
+
+pub mod envelope;

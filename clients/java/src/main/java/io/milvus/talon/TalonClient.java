@@ -94,7 +94,14 @@ public final class TalonClient implements AutoCloseable {
      * {@link #read(String, String, long, long)} to supply a known version and
      * skip that round trip.
      */
-    public byte[] read(String uri, long offset, long length) throws IOException {
+    public byte[] read(String uri, long offset, long length) throws IOException { return read(uri, offset, length, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public byte[] read(String uri, long offset, long length, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(uri, offset, length));
+    }
+
+    private byte[] readInternal(String uri, long offset, long length) throws IOException {
         ObjectId object = ObjectId.parse(uri);
         ObjectStat stat = stat(object);
         return read(object, stat.version(), offset, Math.min(length, Math.max(0, stat.size() - offset)));
@@ -107,13 +114,26 @@ public final class TalonClient implements AutoCloseable {
      * stable for an object generation, so re-resolving it per read is wasted
      * work.
      */
-    public byte[] read(String uri, String version, long offset, long length) throws IOException {
+    public byte[] read(String uri, String version, long offset, long length) throws IOException { return read(uri, version, offset, length, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public byte[] read(String uri, String version, long offset, long length, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(uri, version, offset, length));
+    }
+
+    private byte[] readInternal(String uri, String version, long offset, long length) throws IOException {
         return read(ObjectId.parse(uri), version, offset, length);
     }
 
     /** As {@link #read(String, String, long, long)}, with a parsed object id. */
-    public byte[] read(ObjectId object, String version, long offset, long length)
-            throws IOException {
+    public byte[] read(ObjectId object, String version, long offset, long length) throws IOException { return read(object, version, offset, length, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public byte[] read(ObjectId object, String version, long offset, long length, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(object, version, offset, length));
+    }
+
+    private byte[] readInternal(ObjectId object, String version, long offset, long length) throws IOException {
         if (offset < 0 || length < 0) {
             throw new IllegalArgumentException(
                     "offset and length must be non-negative, got offset=" + offset
@@ -130,12 +150,26 @@ public final class TalonClient implements AutoCloseable {
     }
 
     /** Return an object's size and version. */
-    public ObjectStat stat(String uri) throws IOException {
+    public ObjectStat stat(String uri) throws IOException { return stat(uri, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public ObjectStat stat(String uri, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(uri));
+    }
+
+    private ObjectStat statInternal(String uri) throws IOException {
         return stat(ObjectId.parse(uri));
     }
 
     /** As {@link #stat(String)}, with a parsed object id. */
-    public ObjectStat stat(ObjectId object) throws IOException {
+    public ObjectStat stat(ObjectId object) throws IOException { return stat(object, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public ObjectStat stat(ObjectId object, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(object));
+    }
+
+    private ObjectStat statInternal(ObjectId object) throws IOException {
         int id = requestIds.getAndIncrement();
         Messages.Response resp = controlRoundTrip(Messages.statObject(id, object));
         if (resp.tag == Messages.TAG_OBJECT_STAT) {
@@ -374,7 +408,7 @@ public final class TalonClient implements AutoCloseable {
     private Messages.Response controlRoundTrip(byte[] request) throws IOException {
         try (Socket socket = dial(coordinator)) {
             OutputStream out = socket.getOutputStream();
-            out.write(request);
+            out.write(Telemetry.envelope(request, coordinator));
             out.flush();
 
             Frame header = readHeader(socket.getInputStream());
@@ -399,8 +433,12 @@ public final class TalonClient implements AutoCloseable {
 
         try (Socket socket = dial(workerAddress)) {
             OutputStream out = socket.getOutputStream();
-            out.write(header);
-            out.write(body);
+            if (Telemetry.canSend(workerAddress)) {
+            byte[] frame = new byte[header.length + body.length];
+            System.arraycopy(header, 0, frame, 0, header.length);
+            System.arraycopy(body, 0, frame, header.length, body.length);
+            out.write(Telemetry.envelope(frame, workerAddress));
+            } else { out.write(header); out.write(body); }
             out.flush();
 
             InputStream in = socket.getInputStream();

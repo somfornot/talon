@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/talon-telemetry",
     "crates/talon-core",
     "crates/talon-cache-client",
     "crates/talon-gateway",
@@ -25,6 +26,7 @@ repository = "https://github.com/talon/talon"
 rust-version = "1.80"
 
 [workspace.dependencies]
+talon-telemetry = { path = "crates/talon-telemetry" }
 talon-core = { path = "crates/talon-core" }
 talon-cache-client = { path = "crates/talon-cache-client" }
 talon-rust-client = { path = "clients/rust" }
@@ -61,6 +63,7 @@ axum = "0.8"
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["timeout"] }
 http-body-util = "0.1"
+http-body = "1"
 httpdate = "1"
 serde_yaml = "0.9"
 # Kubernetes client for the Lease-based ClusterStateStore backend (feature

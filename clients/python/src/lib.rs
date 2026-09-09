@@ -25,6 +25,76 @@ use talon_rust_client::{
     parse_uri, Client as RustClient, Error as RustError, ObjectStat as RustObjectStat,
 };
 
+/// Capture language context while the GIL and caller context are still active.
+fn capture_trace(
+    py: Python<'_>,
+    explicit: Option<std::collections::HashMap<String, String>>,
+) -> Option<talon_telemetry::TraceContext> {
+    if !talon_telemetry::enabled() {
+        return None;
+    }
+    let carrier = explicit.or_else(|| {
+        let module = py.import_bound("opentelemetry.propagate").ok()?;
+        let carrier = pyo3::types::PyDict::new_bound(py);
+        module.getattr("inject").ok()?.call1((&carrier,)).ok()?;
+        carrier.extract().ok()
+    })?;
+    talon_telemetry::TraceContext::from_w3c(
+        carrier.get("traceparent")?,
+        carrier.get("tracestate").map(String::as_str),
+    )
+}
+
+#[cfg(feature = "telemetry")]
+static TELEMETRY: std::sync::Mutex<
+    Option<(talon_telemetry::export::ExportOwner, tracing::Dispatch)>,
+> = std::sync::Mutex::new(None);
+
+/// Explicit initialization; Python host provider/subscriber is never replaced.
+#[pyfunction]
+fn configure_telemetry() -> PyResult<()> {
+    #[cfg(feature = "telemetry")]
+    {
+        let mut session = TELEMETRY.lock().unwrap();
+        if session.is_some() {
+            return Err(PyValueError::new_err("telemetry already initialized"));
+        }
+        *session = Some(
+            talon_telemetry::export::init_scoped("talon-python")
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "telemetry"))]
+    talon_telemetry::Config::from_env()
+        .and_then(talon_telemetry::configure)
+        .map_err(PyValueError::new_err)
+}
+
+/// Drain clients before shutdown. Export waiting happens without the GIL.
+#[pyfunction]
+fn shutdown_telemetry(py: Python<'_>) {
+    #[cfg(feature = "telemetry")]
+    {
+        let session = TELEMETRY.lock().unwrap().take();
+        if let Some((owner, _)) = session {
+            py.allow_threads(move || owner.shutdown());
+        }
+    }
+    let _ = py;
+}
+
+fn with_telemetry<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "telemetry")]
+    if talon_telemetry::enabled() {
+        let dispatch = TELEMETRY.lock().unwrap().as_ref().map(|(_, d)| d.clone());
+        if let Some(dispatch) = dispatch {
+            return tracing::dispatcher::with_default(&dispatch, f);
+        }
+    }
+    f()
+}
+
 /// Runtime construction failures are infrastructure errors.
 fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyIOError::new_err(e.to_string())
@@ -133,7 +203,8 @@ impl Client {
     /// `version` and `size` are resolved with a `stat` when omitted. Pass them
     /// to skip that round trip when they are already known — for example when
     /// reading many ranges of the same object.
-    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None))]
+    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None, trace_context = None))]
+    #[allow(clippy::too_many_arguments)]
     fn read<'py>(
         &self,
         py: Python<'py>,
@@ -142,7 +213,9 @@ impl Client {
         length: Option<u64>,
         version: Option<&str>,
         size: Option<u64>,
+        trace_context: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let known_version = version.map(str::to_owned);
         let runtime = Arc::clone(&self.runtime);
@@ -151,18 +224,36 @@ impl Client {
         // Release the GIL: this is network I/O, and holding it would serialise
         // every reader thread in the process on one request.
         let bytes = py.allow_threads(move || {
-            runtime.block_on(async move {
-                let known_stat = match (known_version, size) {
-                    (Some(version), Some(size)) => Some(RustObjectStat { size, version }),
-                    (None, None) => None,
-                    (known_version, known_size) => {
-                        let stat = client.stat(&object).await?;
-                        Some(complete_known_stat(known_version, known_size, stat))
-                    }
-                };
-                client
-                    .read(&object, offset, length, known_stat.as_ref())
-                    .await
+            with_telemetry(|| {
+                runtime.block_on(async move {
+                    let operation = talon_telemetry::Operation::new(
+                        "talon.python.read",
+                        "internal",
+                        trace_context
+                            .as_ref()
+                            .map(talon_telemetry::TraceParent::Explicit)
+                            .unwrap_or(talon_telemetry::TraceParent::Root),
+                    );
+                    let result = operation
+                        .scope(async {
+                            let known_stat = match (known_version, size) {
+                                (Some(version), Some(size)) => {
+                                    Some(RustObjectStat { size, version })
+                                }
+                                (None, None) => None,
+                                (known_version, known_size) => {
+                                    let stat = client.stat(&object).await?;
+                                    Some(complete_known_stat(known_version, known_size, stat))
+                                }
+                            };
+                            client
+                                .read(&object, offset, length, known_stat.as_ref())
+                                .await
+                        })
+                        .await;
+                    operation.outcome(if result.is_ok() { "success" } else { "error" });
+                    result
+                })
             })
         });
         let bytes = bytes.map_err(client_err)?;
@@ -170,12 +261,30 @@ impl Client {
     }
 
     /// Return an object's size and version.
-    fn stat(&self, py: Python<'_>, uri: &str) -> PyResult<ObjectStat> {
+    #[pyo3(signature = (uri, *, trace_context = None))]
+    fn stat(
+        &self,
+        py: Python<'_>,
+        uri: &str,
+        trace_context: Option<std::collections::HashMap<String, String>>,
+    ) -> PyResult<ObjectStat> {
+        let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
-        let stat =
-            py.allow_threads(move || runtime.block_on(async move { client.stat(&object).await }));
+        let stat = py.allow_threads(move || {
+            with_telemetry(|| {
+                runtime.block_on(async move {
+                    let options = talon_telemetry::RequestOptions {
+                        parent: trace_context
+                            .as_ref()
+                            .map(talon_telemetry::TraceParent::Explicit)
+                            .unwrap_or(talon_telemetry::TraceParent::Root),
+                    };
+                    client.stat_with_options(&object, &options).await
+                })
+            })
+        });
         let stat = stat.map_err(client_err)?;
         Ok(ObjectStat {
             size: stat.size,
@@ -243,6 +352,8 @@ impl Client {
 
 #[pymodule]
 fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(configure_telemetry, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown_telemetry, m)?)?;
     m.add_class::<Client>()?;
     m.add_class::<ObjectStat>()?;
     m.add_class::<ObjectEntry>()?;
@@ -283,6 +394,7 @@ mod tests {
                 Some(oversized),
                 Some("version"),
                 Some(oversized),
+                None,
             ) {
                 Ok(_) => panic!("oversized read must fail"),
                 Err(error) => error,
@@ -298,7 +410,7 @@ mod tests {
         let client = Client::new("127.0.0.1:0", 1).unwrap();
 
         Python::with_gil(|py| {
-            let error = match client.stat(py, "s3://bucket/key") {
+            let error = match client.stat(py, "s3://bucket/key", None) {
                 Ok(_) => panic!("stat without a coordinator must fail"),
                 Err(error) => error,
             };

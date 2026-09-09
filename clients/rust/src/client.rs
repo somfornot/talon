@@ -43,6 +43,23 @@ impl Client {
 
     /// Return an object's current size and source version.
     pub async fn stat(&self, object: &ObjectId) -> Result<ObjectStat, Error> {
+        self.stat_with_options(object, &crate::RequestOptions::default())
+            .await
+    }
+
+    /// Stat with an explicit request-local parent policy.
+    pub async fn stat_with_options(
+        &self,
+        object: &ObjectId,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<ObjectStat, Error> {
+        let op = talon_telemetry::Operation::new("talon.stat", "internal", options.parent);
+        let result = op.scope(self.stat_inner(object)).await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn stat_inner(&self, object: &ObjectId) -> Result<ObjectStat, Error> {
         Ok(self.coordinator.stat_object(object).await?)
     }
 
@@ -59,12 +76,46 @@ impl Client {
         length: Option<u64>,
         known_stat: Option<&ObjectStat>,
     ) -> Result<Vec<u8>, Error> {
+        self.read_with_options(
+            object,
+            offset,
+            length,
+            known_stat,
+            &crate::RequestOptions::default(),
+        )
+        .await
+    }
+
+    /// Read with explicit parent selection; stat and block RPCs share this scope.
+    pub async fn read_with_options(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        length: Option<u64>,
+        known_stat: Option<&ObjectStat>,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
+        let result = op
+            .scope(self.read_inner(object, offset, length, known_stat))
+            .await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn read_inner(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        length: Option<u64>,
+        known_stat: Option<&ObjectStat>,
+    ) -> Result<Vec<u8>, Error> {
         if length == Some(0) {
             return Ok(Vec::new());
         }
         let stat = match known_stat {
             Some(stat) => stat.clone(),
-            None => self.stat(object).await?,
+            None => self.stat_inner(object).await?,
         };
         let requested = length.unwrap_or_else(|| stat.size.saturating_sub(offset));
         let planned = requested.min(stat.size.saturating_sub(offset));
@@ -97,12 +148,46 @@ impl Client {
         dst: &mut [u8],
         known_stat: Option<&ObjectStat>,
     ) -> Result<usize, Error> {
+        self.read_into_with_options(
+            object,
+            offset,
+            dst,
+            known_stat,
+            &crate::RequestOptions::default(),
+        )
+        .await
+    }
+
+    /// Read with explicit parent selection; stat and block RPCs share this scope.
+    pub async fn read_into_with_options(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        dst: &mut [u8],
+        known_stat: Option<&ObjectStat>,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<usize, Error> {
+        let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
+        let result = op
+            .scope(self.read_into_inner(object, offset, dst, known_stat))
+            .await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn read_into_inner(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        dst: &mut [u8],
+        known_stat: Option<&ObjectStat>,
+    ) -> Result<usize, Error> {
         if dst.is_empty() {
             return Ok(0);
         }
         let stat = match known_stat {
             Some(stat) => stat.clone(),
-            None => self.stat(object).await?,
+            None => self.stat_inner(object).await?,
         };
         self.read_into_resolved(object, offset, dst, &stat).await
     }
@@ -126,6 +211,9 @@ impl Client {
             stat.size,
         );
         let planned_len: usize = plan.iter().map(|segment| segment.len as usize).sum();
+        talon_telemetry::record("talon.range.offset", offset);
+        talon_telemetry::record("talon.range.length", planned_len as u64);
+        talon_telemetry::record("talon.read.planned_blocks", plan.len() as u64);
         if planned_len == 0 {
             return Ok(0);
         }

@@ -190,7 +190,7 @@ pub enum DataError {
 pub fn encode_request(request_id: u32, req: &RangeRequest) -> Result<Vec<u8>, DataError> {
     let body = bincode::serialize(req)?;
     let header = FrameHeader::new(MsgType::GetRange, request_id, body.len() as u32);
-    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
     buf.extend_from_slice(&header.encode());
     buf.extend_from_slice(&body);
     Ok(buf)
@@ -210,6 +210,7 @@ pub fn decode_request(buf: &[u8]) -> Result<(FrameHeader, RangeRequest), DataErr
             actual: body.len(),
         });
     }
+    let (_, body) = crate::envelope::decode(&header, body)?;
     let req: RangeRequest = bincode::deserialize(body)?;
     Ok((header, req))
 }
@@ -228,7 +229,7 @@ pub fn encode_tenant_request(
 ) -> Result<Vec<u8>, DataError> {
     let body = bincode::serialize(scoped)?;
     let header = FrameHeader::new(MsgType::GetRangeTenant, request_id, body.len() as u32);
-    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
     buf.extend_from_slice(&header.encode());
     buf.extend_from_slice(&body);
     Ok(buf)
@@ -248,6 +249,7 @@ pub fn decode_tenant_request(buf: &[u8]) -> Result<(FrameHeader, TenantScopedRan
             actual: body.len(),
         });
     }
+    let (_, body) = crate::envelope::decode(&header, body)?;
     let scoped = bincode::deserialize(body)?;
     Ok((header, scoped))
 }
@@ -260,7 +262,7 @@ pub fn encode_cached_request(
 ) -> Result<Vec<u8>, DataError> {
     let body = bincode::serialize(req)?;
     let header = FrameHeader::new(MsgType::GetCachedRange, request_id, body.len() as u32);
-    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
     buf.extend_from_slice(&header.encode());
     buf.extend_from_slice(&body);
     Ok(buf)
@@ -280,6 +282,7 @@ pub fn decode_cached_request(buf: &[u8]) -> Result<(FrameHeader, CachedRangeRequ
             actual: body.len(),
         });
     }
+    let (_, body) = crate::envelope::decode(&header, body)?;
     let req = bincode::deserialize(body)?;
     Ok((header, req))
 }
@@ -297,7 +300,7 @@ pub fn encode_cached_tenant_request(
 ) -> Result<Vec<u8>, DataError> {
     let body = bincode::serialize(scoped)?;
     let header = FrameHeader::new(MsgType::GetCachedRangeTenant, request_id, body.len() as u32);
-    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
     buf.extend_from_slice(&header.encode());
     buf.extend_from_slice(&body);
     Ok(buf)
@@ -320,6 +323,7 @@ pub fn decode_cached_tenant_request(
             actual: body.len(),
         });
     }
+    let (_, body) = crate::envelope::decode(&header, body)?;
     let scoped = bincode::deserialize(body)?;
     Ok((header, scoped))
 }

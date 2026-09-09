@@ -18,6 +18,59 @@ use talon_rust_client::{
     ObjectStat as RustObjectStat, UriError,
 };
 
+mod trace_options;
+pub use trace_options::{talon_request_options_init, TalonRequestOptions};
+
+#[cfg(feature = "telemetry")]
+static TELEMETRY: std::sync::Mutex<
+    Option<(talon_telemetry::export::ExportOwner, tracing::Dispatch)>,
+> = std::sync::Mutex::new(None);
+
+/// Explicit process initialization. Subscriber remains scoped to Talon tasks.
+#[no_mangle]
+pub extern "C" fn talon_telemetry_init() -> c_int {
+    ffi_status(|| {
+        #[cfg(feature = "telemetry")]
+        {
+            let mut session = TELEMETRY.lock().unwrap();
+            if session.is_some() {
+                return Err((
+                    STATUS_INVALID_ARGUMENT,
+                    "telemetry already initialized".into(),
+                ));
+            }
+            *session = Some(
+                talon_telemetry::export::init_scoped("talon-c")
+                    .map_err(|e| (STATUS_RUNTIME_ERROR, e.to_string()))?,
+            );
+            Ok(())
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            talon_telemetry::Config::from_env()
+                .and_then(talon_telemetry::configure)
+                .map_err(|e| (STATUS_INVALID_ARGUMENT, e))
+        }
+    })
+}
+
+/// Call after all client operations finish, outside SDK callbacks.
+#[no_mangle]
+pub extern "C" fn talon_telemetry_shutdown() {
+    #[cfg(feature = "telemetry")]
+    if let Some((owner, _)) = TELEMETRY.lock().unwrap().take() {
+        owner.shutdown();
+    }
+}
+
+fn telemetry_dispatch() -> tracing::Dispatch {
+    #[cfg(feature = "telemetry")]
+    if let Some((_, dispatch)) = TELEMETRY.lock().unwrap().as_ref() {
+        return dispatch.clone();
+    }
+    tracing::dispatcher::get_default(Clone::clone)
+}
+
 const DEFAULT_BLOCK_SIZE: u32 = 256 << 20;
 
 const STATUS_OK: c_int = 0;
@@ -284,7 +337,40 @@ pub unsafe extern "C" fn talon_read_async(
     user_data: *mut c_void,
     request_id_out: *mut u64,
 ) -> c_int {
+    unsafe {
+        talon_read_async_with_options(
+            client,
+            uri,
+            offset,
+            dst,
+            dst_len,
+            version,
+            object_size,
+            ptr::null(),
+            callback,
+            user_data,
+            request_id_out,
+        )
+    }
+}
+
+/// Submit with copied request-local W3C context.
+#[no_mangle]
+pub unsafe extern "C" fn talon_read_async_with_options(
+    client: *mut TalonClient,
+    uri: *const c_char,
+    offset: u64,
+    dst: *mut u8,
+    dst_len: usize,
+    version: *const c_char,
+    object_size: *const u64,
+    options: *const TalonRequestOptions,
+    callback: Option<TalonCallback>,
+    user_data: *mut c_void,
+    request_id_out: *mut u64,
+) -> c_int {
     ffi_status(|| {
+        let trace_context = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -333,14 +419,21 @@ pub unsafe extern "C" fn talon_read_async(
             (Some(version), Some(size)) => Some(RustObjectStat { size, version }),
             _ => None,
         };
-        runtime.spawn(async move {
+        use tracing::instrument::WithSubscriber;
+        let task = async move {
+            let options = talon_rust_client::RequestOptions {
+                parent: trace_context
+                    .as_ref()
+                    .map(talon_rust_client::TraceParent::Explicit)
+                    .unwrap_or(talon_rust_client::TraceParent::Root),
+            };
             let result = async {
                 if read_buffer.len == 0 {
                     return Ok(0);
                 }
                 let dst = unsafe { read_buffer.into_mut_slice() };
                 client
-                    .read_into(&object, offset, dst, known_stat.as_ref())
+                    .read_into_with_options(&object, offset, dst, known_stat.as_ref(), &options)
                     .await
                     .map_err(|error| error.to_string())
             }
@@ -351,7 +444,12 @@ pub unsafe extern "C" fn talon_read_async(
                 user_data,
                 TalonResult::read(request_id, result),
             );
-        });
+        };
+        if talon_telemetry::enabled() {
+            runtime.spawn(task.with_subscriber(telemetry_dispatch()));
+        } else {
+            runtime.spawn(task);
+        }
         Ok(())
     })
 }
@@ -365,7 +463,30 @@ pub unsafe extern "C" fn talon_stat_async(
     user_data: *mut c_void,
     request_id_out: *mut u64,
 ) -> c_int {
+    unsafe {
+        talon_stat_async_with_options(
+            client,
+            uri,
+            ptr::null(),
+            callback,
+            user_data,
+            request_id_out,
+        )
+    }
+}
+
+/// Submit with copied request-local W3C context.
+#[no_mangle]
+pub unsafe extern "C" fn talon_stat_async_with_options(
+    client: *mut TalonClient,
+    uri: *const c_char,
+    options: *const TalonRequestOptions,
+    callback: Option<TalonCallback>,
+    user_data: *mut c_void,
+    request_id_out: *mut u64,
+) -> c_int {
     ffi_status(|| {
+        let trace_context = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -388,9 +509,16 @@ pub unsafe extern "C" fn talon_stat_async(
         let runtime = Arc::clone(&inner.runtime);
         let client = Arc::clone(&inner.client);
         let dispatcher = Arc::clone(&inner.dispatcher);
-        runtime.spawn(async move {
+        use tracing::instrument::WithSubscriber;
+        let task = async move {
+            let options = talon_rust_client::RequestOptions {
+                parent: trace_context
+                    .as_ref()
+                    .map(talon_rust_client::TraceParent::Explicit)
+                    .unwrap_or(talon_rust_client::TraceParent::Root),
+            };
             let result = client
-                .stat(&object)
+                .stat_with_options(&object, &options)
                 .await
                 .map_err(|error| error.to_string());
             dispatch_result(
@@ -399,7 +527,12 @@ pub unsafe extern "C" fn talon_stat_async(
                 user_data,
                 TalonResult::stat(request_id, result),
             );
-        });
+        };
+        if talon_telemetry::enabled() {
+            runtime.spawn(task.with_subscriber(telemetry_dispatch()));
+        } else {
+            runtime.spawn(task);
+        }
         Ok(())
     })
 }

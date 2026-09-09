@@ -94,231 +94,291 @@ pub async fn handle_conn(
             Err(e) => return Err(anyhow::anyhow!(e)),
         };
 
-        match header.msg_type {
-            MsgType::Put => {
-                handle_put(
-                    &mut stream,
-                    &mut reader,
-                    &header,
-                    &payload,
-                    &worker,
-                    &observability,
-                    request_started,
-                )
-                .await?;
-                continue;
+        let (metadata, _) = talon_transport::envelope::decode(&header, &payload)?;
+        let operation =
+            talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);
+        operation.text("talon.runtime", "uring");
+        match operation
+            .scope(handle_request(
+                stream,
+                &header,
+                &payload,
+                &worker,
+                &observability,
+                request_started,
+                &mut reader,
+            ))
+            .await
+        {
+            Ok(Some(returned)) => {
+                operation.outcome("success");
+                stream = returned;
             }
-            MsgType::AdmitCachedBlock => {
-                if !handle_cached_block_admission(
-                    &mut stream,
-                    &mut reader,
-                    &header,
-                    &payload,
-                    &worker,
-                    &observability,
-                    request_started,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-                continue;
+            Ok(None) => {
+                operation.outcome("closed");
+                return Ok(());
             }
-            MsgType::Delete => {
-                handle_delete(
-                    &mut stream,
-                    &header,
-                    &payload,
-                    &worker,
-                    &observability,
-                    request_started,
-                )
-                .await?;
-                continue;
-            }
-            // A Control frame on the data plane carries StatObject (#318):
-            // clients already hold this connection, and only a worker has the
-            // backend credentials to resolve a version.
-            MsgType::Control => {
-                handle_control_frame(
-                    &mut stream,
-                    &header,
-                    &payload,
-                    &worker,
-                    &observability,
-                    request_started,
-                )
-                .await?;
-                continue;
-            }
-            MsgType::GetCachedRange | MsgType::GetCachedRangeTenant => {
-                handle_cached_range(
-                    &mut stream,
-                    &header,
-                    &payload,
-                    &worker,
-                    &observability,
-                    request_started,
-                )
-                .await?;
-                continue;
-            }
-            MsgType::GetRange | MsgType::GetRangeTenant => {}
-            // A data listener serves only GetRange/Put/Delete; anything else is
-            // rejected before any per-request work.
-            _ => {
-                let err = data::encode_typed_error(
-                    header.request_id,
-                    DataErrorCode::InvalidRequest,
-                    "worker only serves GetRange/Put/Delete/StatObject/ListObjects",
-                );
-                write_all(&mut stream, err).await?;
-                observability
-                    .metrics()
-                    .record_request_error(request_started.elapsed());
-                continue;
-            }
-        }
-
-        let (h, req, tenant) = match decode_range_with_tenant(&header, &payload) {
-            Ok(v) => v,
-            Err(e) => {
-                let err = data::encode_typed_error(
-                    header.request_id,
-                    DataErrorCode::InvalidRequest,
-                    format!("bad request: {e}"),
-                );
-                write_all(&mut stream, err).await?;
-                observability
-                    .metrics()
-                    .record_request_error(request_started.elapsed());
-                continue;
-            }
-        };
-
-        // The declared tenant is attacker-controlled on the unauthenticated data
-        // plane; reject an empty or over-long name before it is used as a cell
-        // key or telemetry label. `Unattributed` always validates.
-        if let Err(e) = tenant.validate() {
-            let err = data::encode_typed_error(
-                h.request_id,
-                DataErrorCode::InvalidRequest,
-                format!("invalid tenant: {e}"),
-            );
-            write_all(&mut stream, err).await?;
-            observability
-                .metrics()
-                .record_request_error(request_started.elapsed());
-            continue;
-        }
-
-        if !observability.is_ready() {
-            let err = data::encode_typed_error(
-                h.request_id,
-                DataErrorCode::Unavailable,
-                "worker is not ready",
-            );
-            write_all(&mut stream, err).await?;
-            observability
-                .metrics()
-                .record_request_error(request_started.elapsed());
-            continue;
-        }
-
-        if req.offset.checked_add(req.len).is_none() {
-            let err = data::encode_typed_error(
-                h.request_id,
-                DataErrorCode::InvalidRequest,
-                "range offset+len overflows u64",
-            );
-            write_all(&mut stream, err).await?;
-            observability
-                .metrics()
-                .record_request_error(request_started.elapsed());
-            continue;
-        }
-
-        if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
-            let err = data::encode_typed_error(
-                h.request_id,
-                DataErrorCode::RateLimited,
-                format!(
-                    "tenant rate limit exceeded on {}; retry after {} ms",
-                    throttled.metric.label(),
-                    throttled.retry_after.as_millis()
-                ),
-            );
-            write_all(&mut stream, err).await?;
-            observability
-                .metrics()
-                .record_rate_limited(throttled.metric);
-            continue;
-        }
-
-        match worker.serve(&req).await {
-            Ok(ServeOutcome::Sendfile(handle)) => {
-                let len = handle.len;
-                let hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
-                match sendfile_payload(&stream, hdr, handle).await {
-                    Ok(()) => observability
-                        .metrics()
-                        .record_request_success(len, request_started.elapsed()),
-                    Err(error) => {
-                        // The header is already on the wire, so an error frame
-                        // would be read as payload. The connection is desynced;
-                        // drop it.
-                        observability
-                            .metrics()
-                            .record_request_error(request_started.elapsed());
-                        return Err(error);
-                    }
-                }
-            }
-            Ok(ServeOutcome::SendfileMany(handles)) => {
-                let len: u64 = handles.iter().map(|h| h.len).sum();
-                let hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
-                match sendfile_many_payload(&stream, hdr, handles).await {
-                    Ok(()) => observability
-                        .metrics()
-                        .record_request_success(len, request_started.elapsed()),
-                    Err(error) => {
-                        // Header already on the wire; the connection is desynced.
-                        observability
-                            .metrics()
-                            .record_request_error(request_started.elapsed());
-                        return Err(error);
-                    }
-                }
-            }
-            Ok(ServeOutcome::Bytes(bytes)) => {
-                let hdr = data::response_header_ok(h.request_id, bytes.len() as u32).to_vec();
-                write_all(&mut stream, hdr).await?;
-                let n = bytes.len() as u64;
-                // `bytes` is already refcounted and monoio can submit it
-                // directly, so hand it to the ring rather than copying it into
-                // a fresh Vec.
-                write_all_buf(&mut stream, bytes).await?;
-                observability
-                    .metrics()
-                    .record_request_success(n, request_started.elapsed());
-            }
-            Err(e) => {
-                tracing::error!(
-                    req = %RequestId(h.request_id),
-                    object = %req.object.to_path(),
-                    offset = req.offset,
-                    len = req.len,
-                    error = %e,
-                    "serving range failed"
-                );
-                let err = encode_runtime_error(h.request_id, &e);
-                write_all(&mut stream, err).await?;
-                observability
-                    .metrics()
-                    .record_request_error(request_started.elapsed());
+            Err(error) => {
+                operation.outcome("error");
+                return Err(error);
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_request(
+    mut stream: TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+    reader: &mut BufferedFrameReader,
+) -> anyhow::Result<Option<TcpStream>> {
+    let response_version = header.version;
+    match header.msg_type {
+        MsgType::Put => {
+            handle_put(
+                &mut stream,
+                reader,
+                header,
+                payload,
+                worker,
+                observability,
+                request_started,
+            )
+            .await?;
+            return Ok(Some(stream));
+        }
+        MsgType::AdmitCachedBlock => {
+            if !handle_cached_block_admission(
+                &mut stream,
+                reader,
+                header,
+                payload,
+                worker,
+                observability,
+                request_started,
+            )
+            .await?
+            {
+                return Ok(None);
+            }
+            return Ok(Some(stream));
+        }
+        MsgType::Delete => {
+            handle_delete(
+                &mut stream,
+                header,
+                payload,
+                worker,
+                observability,
+                request_started,
+            )
+            .await?;
+            return Ok(Some(stream));
+        }
+        // A Control frame on the data plane carries StatObject (#318):
+        // clients already hold this connection, and only a worker has the
+        // backend credentials to resolve a version.
+        MsgType::Control => {
+            handle_control_frame(
+                &mut stream,
+                header,
+                payload,
+                worker,
+                observability,
+                request_started,
+            )
+            .await?;
+            return Ok(Some(stream));
+        }
+        MsgType::GetCachedRange | MsgType::GetCachedRangeTenant => {
+            handle_cached_range(
+                &mut stream,
+                header,
+                payload,
+                worker,
+                observability,
+                request_started,
+            )
+            .await?;
+            return Ok(Some(stream));
+        }
+        MsgType::GetRange | MsgType::GetRangeTenant => {}
+        // A data listener serves only GetRange/Put/Delete; anything else is
+        // rejected before any per-request work.
+        _ => {
+            let mut err = data::encode_typed_error(
+                header.request_id,
+                DataErrorCode::InvalidRequest,
+                "worker only serves GetRange/Put/Delete/StatObject/ListObjects",
+            );
+            err[2] = response_version;
+            talon_telemetry::outcome("error");
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(Some(stream));
+        }
+    }
+
+    let (h, req, tenant) = match decode_range_with_tenant(header, payload) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut err = data::encode_typed_error(
+                header.request_id,
+                DataErrorCode::InvalidRequest,
+                format!("bad request: {e}"),
+            );
+            err[2] = response_version;
+            talon_telemetry::outcome("error");
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(Some(stream));
+        }
+    };
+
+    // The declared tenant is attacker-controlled on the unauthenticated data
+    // plane; reject an empty or over-long name before it is used as a cell
+    // key or telemetry label. `Unattributed` always validates.
+    if let Err(e) = tenant.validate() {
+        let mut err = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::InvalidRequest,
+            format!("invalid tenant: {e}"),
+        );
+        err[2] = response_version;
+        talon_telemetry::outcome("error");
+        write_all(&mut stream, err).await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(Some(stream));
+    }
+
+    if !observability.is_ready() {
+        let mut err = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::Unavailable,
+            "worker is not ready",
+        );
+        err[2] = response_version;
+        talon_telemetry::outcome("error");
+        write_all(&mut stream, err).await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(Some(stream));
+    }
+
+    if req.offset.checked_add(req.len).is_none() {
+        let mut err = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::InvalidRequest,
+            "range offset+len overflows u64",
+        );
+        err[2] = response_version;
+        talon_telemetry::outcome("error");
+        write_all(&mut stream, err).await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(Some(stream));
+    }
+
+    if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
+        let mut err = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::RateLimited,
+            format!(
+                "tenant rate limit exceeded on {}; retry after {} ms",
+                throttled.metric.label(),
+                throttled.retry_after.as_millis()
+            ),
+        );
+        err[2] = response_version;
+        talon_telemetry::outcome("error");
+        write_all(&mut stream, err).await?;
+        observability
+            .metrics()
+            .record_rate_limited(throttled.metric);
+        return Ok(Some(stream));
+    }
+
+    match worker.serve(&req).await {
+        Ok(ServeOutcome::Sendfile(handle)) => {
+            let len = handle.len;
+            let mut hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
+            hdr[2] = response_version;
+            match sendfile_payload(&stream, hdr, handle).await {
+                Ok(()) => observability
+                    .metrics()
+                    .record_request_success(len, request_started.elapsed()),
+                Err(error) => {
+                    // The header is already on the wire, so an error frame
+                    // would be read as payload. The connection is desynced;
+                    // drop it.
+                    observability
+                        .metrics()
+                        .record_request_error(request_started.elapsed());
+                    return Err(error);
+                }
+            }
+        }
+        Ok(ServeOutcome::SendfileMany(handles)) => {
+            let len: u64 = handles.iter().map(|h| h.len).sum();
+            let mut hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
+            hdr[2] = response_version;
+            match sendfile_many_payload(&stream, hdr, handles).await {
+                Ok(()) => observability
+                    .metrics()
+                    .record_request_success(len, request_started.elapsed()),
+                Err(error) => {
+                    // Header already on the wire; the connection is desynced.
+                    observability
+                        .metrics()
+                        .record_request_error(request_started.elapsed());
+                    return Err(error);
+                }
+            }
+        }
+        Ok(ServeOutcome::Bytes(bytes)) => {
+            let mut hdr = data::response_header_ok(h.request_id, bytes.len() as u32).to_vec();
+            hdr[2] = response_version;
+            write_all(&mut stream, hdr).await?;
+            let n = bytes.len() as u64;
+            // `bytes` is already refcounted and monoio can submit it
+            // directly, so hand it to the ring rather than copying it into
+            // a fresh Vec.
+            write_all_buf(&mut stream, bytes).await?;
+            observability
+                .metrics()
+                .record_request_success(n, request_started.elapsed());
+        }
+        Err(e) => {
+            tracing::error!(
+                req = %RequestId(h.request_id),
+                object = %req.object.to_path(),
+                offset = req.offset,
+                len = req.len,
+                error = %e,
+                "serving range failed"
+            );
+            let mut err = encode_runtime_error(h.request_id, &e);
+            err[2] = response_version;
+            talon_telemetry::outcome("error");
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(Some(stream))
 }
 
 /// Decode a `GetRange` or `GetRangeTenant` frame into its request and the tenant
@@ -363,15 +423,26 @@ async fn handle_cached_block_admission(
     observability: &Arc<WorkerObservability>,
     request_started: Instant,
 ) -> anyhow::Result<bool> {
+    let response_version = header.version;
     let (h, req) = match data::decode_cached_block_put_header(&rejoin(header, payload)) {
         Ok(value) => value,
         Err(error) => {
-            let reply = data::encode_typed_error(
+            let mut reply = data::encode_typed_error(
                 header.request_id,
                 DataErrorCode::InvalidRequest,
                 format!("bad cache admission: {error}"),
             );
-            write_all(stream, reply).await?;
+            reply[2] = response_version;
+            if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+                .contains(talon_transport::Flags::ERROR)
+            {
+                talon_telemetry::outcome("error");
+            }
+            write_all(
+                stream,
+                talon_transport::envelope::response_version(reply, response_version),
+            )
+            .await?;
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());
@@ -379,20 +450,32 @@ async fn handle_cached_block_admission(
         }
     };
     if !observability.is_ready() {
-        let reply = data::encode_typed_error(
+        let mut reply = data::encode_typed_error(
             h.request_id,
             DataErrorCode::Unavailable,
             "worker is not ready",
         );
+        reply[2] = response_version;
+        if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+            .contains(talon_transport::Flags::ERROR)
+        {
+            talon_telemetry::outcome("error");
+        }
         write_all(stream, reply).await?;
         return Ok(false);
     }
     if let Err(error) = worker.validate_cached_block_admission(&req) {
-        let reply = data::encode_typed_error(
+        let mut reply = data::encode_typed_error(
             h.request_id,
             DataErrorCode::InvalidRequest,
             error.to_string(),
         );
+        reply[2] = response_version;
+        if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+            .contains(talon_transport::Flags::ERROR)
+        {
+            talon_telemetry::outcome("error");
+        }
         write_all(stream, reply).await?;
         observability
             .metrics()
@@ -433,15 +516,26 @@ async fn handle_cached_range(
     observability: &WorkerObservability,
     request_started: Instant,
 ) -> std::io::Result<()> {
+    let response_version = header.version;
     let (decoded, request, tenant) = match decode_cached_range_with_tenant(header, payload) {
         Ok(value) => value,
         Err(error) => {
-            let reply = data::encode_typed_error(
+            let mut reply = data::encode_typed_error(
                 header.request_id,
                 DataErrorCode::InvalidRequest,
                 format!("bad cache-only request: {error}"),
             );
-            write_all(stream, reply).await?;
+            reply[2] = response_version;
+            if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+                .contains(talon_transport::Flags::ERROR)
+            {
+                talon_telemetry::outcome("error");
+            }
+            write_all(
+                stream,
+                talon_transport::envelope::response_version(reply, response_version),
+            )
+            .await?;
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());
@@ -449,11 +543,17 @@ async fn handle_cached_range(
         }
     };
     if let Err(error) = tenant.validate() {
-        let reply = data::encode_typed_error(
+        let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::InvalidRequest,
             format!("invalid tenant: {error}"),
         );
+        reply[2] = response_version;
+        if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+            .contains(talon_transport::Flags::ERROR)
+        {
+            talon_telemetry::outcome("error");
+        }
         write_all(stream, reply).await?;
         observability
             .metrics()
@@ -461,11 +561,17 @@ async fn handle_cached_range(
         return Ok(());
     }
     if !observability.is_ready() {
-        let reply = data::encode_typed_error(
+        let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::Unavailable,
             "worker is not ready",
         );
+        reply[2] = response_version;
+        if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+            .contains(talon_transport::Flags::ERROR)
+        {
+            talon_telemetry::outcome("error");
+        }
         write_all(stream, reply).await?;
         observability
             .metrics()
@@ -473,11 +579,17 @@ async fn handle_cached_range(
         return Ok(());
     }
     if request.offset.checked_add(request.len).is_none() {
-        let reply = data::encode_typed_error(
+        let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::InvalidRequest,
             "range offset+len overflows u64",
         );
+        reply[2] = response_version;
+        if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+            .contains(talon_transport::Flags::ERROR)
+        {
+            talon_telemetry::outcome("error");
+        }
         write_all(stream, reply).await?;
         observability
             .metrics()
@@ -488,7 +600,7 @@ async fn handle_cached_range(
     // the tenant's read_iops / read_throughput limits (a plain GetCachedRange
     // carries no tenant and is charged to Unattributed under the default).
     if let Err(throttled) = worker.rate_limiter().admit(&tenant, request.len) {
-        let reply = data::encode_typed_error(
+        let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::RateLimited,
             format!(
@@ -497,6 +609,12 @@ async fn handle_cached_range(
                 throttled.retry_after.as_millis()
             ),
         );
+        reply[2] = response_version;
+        if talon_transport::Flags(u16::from_be_bytes([reply[4], reply[5]]))
+            .contains(talon_transport::Flags::ERROR)
+        {
+            talon_telemetry::outcome("error");
+        }
         write_all(stream, reply).await?;
         observability
             .metrics()
@@ -505,16 +623,25 @@ async fn handle_cached_range(
     }
     match worker.serve_cached(&request).await {
         Ok(bytes) => {
-            let header = data::response_header_ok(decoded.request_id, bytes.len() as u32);
+            let mut header = data::response_header_ok(decoded.request_id, bytes.len() as u32);
+            header[2] = response_version;
             write_all(stream, header.to_vec()).await?;
             let len = bytes.len() as u64;
             write_all(stream, bytes.to_vec()).await?;
+            talon_telemetry::record("talon.response.bytes", len);
             observability
                 .metrics()
                 .record_request_success(len, request_started.elapsed());
         }
         Err(error) => {
-            write_all(stream, encode_runtime_error(decoded.request_id, &error)).await?;
+            write_all(
+                stream,
+                talon_transport::envelope::response_version(
+                    encode_runtime_error(decoded.request_id, &error),
+                    response_version,
+                ),
+            )
+            .await?;
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());
@@ -548,31 +675,34 @@ async fn sendfile_payload(
     header: Vec<u8>,
     handle: BlockHandle,
 ) -> anyhow::Result<()> {
-    let sock_fd = stream.as_raw_fd();
-    let len = handle.len;
-    let sent = monoio::spawn_blocking(move || {
-        // SAFETY-adjacent note: the fd outlives this call because `stream` is
-        // borrowed for the duration of the await, and the connection task is the
-        // only owner.
-        send_header_and_file_range(
-            &FdRef(sock_fd),
-            &header,
-            &handle.fd,
-            handle.offset,
-            handle.len,
-            DEFAULT_CHUNK,
-        )
+    talon_telemetry::observe("talon.response.send", "internal", async {
+        let sock_fd = stream.as_raw_fd();
+        let len = handle.len;
+        let sent = monoio::spawn_blocking(move || {
+            // SAFETY-adjacent note: the fd outlives this call because `stream` is
+            // borrowed for the duration of the await, and the connection task is the
+            // only owner.
+            send_header_and_file_range(
+                &FdRef(sock_fd),
+                &header,
+                &handle.fd,
+                handle.offset,
+                handle.len,
+                DEFAULT_CHUNK,
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
+
+        if sent != len {
+            // sendfile hit EOF before the advertised length: the block file is
+            // shorter than the index claimed. The header already promised `len`
+            // bytes, so the connection is desynced.
+            anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; block file truncated");
+        }
+        Ok(())
     })
     .await
-    .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
-
-    if sent != len {
-        // sendfile hit EOF before the advertised length: the block file is
-        // shorter than the index claimed. The header already promised `len`
-        // bytes, so the connection is desynced.
-        anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; block file truncated");
-    }
-    Ok(())
 }
 
 /// Send a header plus N page segments with one `sendfile` each.
@@ -586,22 +716,25 @@ async fn sendfile_many_payload(
     header: Vec<u8>,
     handles: Vec<BlockHandle>,
 ) -> anyhow::Result<()> {
-    let sock_fd = stream.as_raw_fd();
-    let len: u64 = handles.iter().map(|h| h.len).sum();
-    let sent = monoio::spawn_blocking(move || {
-        let segments: Vec<_> = handles
-            .iter()
-            .map(|h| (FdRef(h.fd.as_raw_fd()), h.offset, h.len))
-            .collect();
-        send_header_and_file_ranges(&FdRef(sock_fd), &header, &segments, DEFAULT_CHUNK)
+    talon_telemetry::observe("talon.response.send", "internal", async {
+        let sock_fd = stream.as_raw_fd();
+        let len: u64 = handles.iter().map(|h| h.len).sum();
+        let sent = monoio::spawn_blocking(move || {
+            let segments: Vec<_> = handles
+                .iter()
+                .map(|h| (FdRef(h.fd.as_raw_fd()), h.offset, h.len))
+                .collect();
+            send_header_and_file_ranges(&FdRef(sock_fd), &header, &segments, DEFAULT_CHUNK)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
+
+        if sent != len {
+            anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; page file truncated");
+        }
+        Ok(())
     })
     .await
-    .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
-
-    if sent != len {
-        anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; page file truncated");
-    }
-    Ok(())
 }
 
 /// A borrowed raw fd that satisfies [`AsRawFd`] without owning or closing it.
@@ -626,7 +759,8 @@ async fn handle_control_frame(
     observability: &Arc<WorkerObservability>,
     request_started: Instant,
 ) -> anyhow::Result<()> {
-    let (h, message) = match talon_transport::codec::decode(&rejoin(header, payload)) {
+    let response_version = header.version;
+    let (h, message) = match talon_transport::codec::decode_request(&rejoin(header, payload)) {
         Ok(v) => v,
         Err(e) => {
             let reply = talon_transport::codec::encode(
@@ -636,7 +770,11 @@ async fn handle_control_frame(
                     detail: Some(format!("bad control message: {e}")),
                 },
             )?;
-            write_all(stream, reply).await?;
+            write_all(
+                stream,
+                talon_transport::envelope::response_version(reply, response_version),
+            )
+            .await?;
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());
@@ -697,9 +835,13 @@ async fn handle_control_frame(
         reply,
         talon_transport::ControlMessage::Ack { ok: false, .. }
     );
-    let buf = talon_transport::codec::encode(h.request_id, &reply)?;
+    let buf = talon_transport::envelope::response_version(
+        talon_transport::codec::encode(h.request_id, &reply)?,
+        response_version,
+    );
     write_all(stream, buf).await?;
     if is_error {
+        talon_telemetry::outcome("error");
         observability
             .metrics()
             .record_request_error(request_started.elapsed());
@@ -722,10 +864,13 @@ async fn handle_put(
     observability: &Arc<WorkerObservability>,
     request_started: Instant,
 ) -> anyhow::Result<()> {
+    let response_version = header.version;
     let (h, req) = match data::decode_put_header(&rejoin(header, payload)) {
         Ok(v) => v,
         Err(e) => {
-            let err = data::encode_error(header.request_id, &format!("bad put: {e}"));
+            let mut err = data::encode_error(header.request_id, &format!("bad put: {e}"));
+            err[2] = response_version;
+            talon_telemetry::outcome("error");
             write_all(stream, err).await?;
             observability
                 .metrics()
@@ -734,7 +879,9 @@ async fn handle_put(
         }
     };
     if !observability.is_ready() {
-        let err = data::encode_error(h.request_id, "worker is not ready");
+        let mut err = data::encode_error(h.request_id, "worker is not ready");
+        err[2] = response_version;
+        talon_telemetry::outcome("error");
         write_all(stream, err).await?;
         return Ok(());
     }
@@ -778,7 +925,8 @@ async fn handle_put(
     match write_result {
         Ok(version) => {
             let vbytes = version.as_str().as_bytes().to_vec();
-            let hdr = data::response_header_ok(h.request_id, vbytes.len() as u32).to_vec();
+            let mut hdr = data::response_header_ok(h.request_id, vbytes.len() as u32).to_vec();
+            hdr[2] = response_version;
             write_all(stream, hdr).await?;
             write_all(stream, vbytes).await?;
             observability
@@ -786,7 +934,9 @@ async fn handle_put(
                 .record_request_success(req.body_len, request_started.elapsed());
         }
         Err(error) => {
-            let err = data::encode_error(h.request_id, &error.to_string());
+            let mut err = data::encode_error(h.request_id, &error.to_string());
+            err[2] = response_version;
+            talon_telemetry::outcome("error");
             write_all(stream, err).await?;
             observability
                 .metrics()
@@ -805,10 +955,13 @@ async fn handle_delete(
     observability: &Arc<WorkerObservability>,
     request_started: Instant,
 ) -> anyhow::Result<()> {
+    let response_version = header.version;
     let (h, req) = match data::decode_delete(&rejoin(header, payload)) {
         Ok(v) => v,
         Err(e) => {
-            let err = data::encode_error(header.request_id, &format!("bad delete: {e}"));
+            let mut err = data::encode_error(header.request_id, &format!("bad delete: {e}"));
+            err[2] = response_version;
+            talon_telemetry::outcome("error");
             write_all(stream, err).await?;
             observability
                 .metrics()
@@ -817,20 +970,25 @@ async fn handle_delete(
         }
     };
     if !observability.is_ready() {
-        let err = data::encode_error(h.request_id, "worker is not ready");
+        let mut err = data::encode_error(h.request_id, "worker is not ready");
+        err[2] = response_version;
+        talon_telemetry::outcome("error");
         write_all(stream, err).await?;
         return Ok(());
     }
     match worker.delete_object(&req.object).await {
         Ok(()) => {
-            let hdr = data::response_header_ok(h.request_id, 0).to_vec();
+            let mut hdr = data::response_header_ok(h.request_id, 0).to_vec();
+            hdr[2] = response_version;
             write_all(stream, hdr).await?;
             observability
                 .metrics()
                 .record_request_success(0, request_started.elapsed());
         }
         Err(error) => {
-            let err = data::encode_error(h.request_id, &error.to_string());
+            let mut err = data::encode_error(h.request_id, &error.to_string());
+            err[2] = response_version;
+            talon_telemetry::outcome("error");
             write_all(stream, err).await?;
             observability
                 .metrics()
@@ -1068,6 +1226,44 @@ mod tests {
             }
         });
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn v2_miss_hit_and_v1_share_connection_without_changing_raw_response() {
+        let root = tmp_root("v2");
+        run(async {
+            let (worker, obs) = build(&root, Arc::new(RampBackend), 16);
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                handle_conn(stream, worker, obs).await.unwrap();
+            });
+            let req = RangeRequest {
+                object: ObjectId::new(talon_core::Backend::Azure, "c", "v2"),
+                offset: 3,
+                len: 8,
+            };
+            let parent = talon_telemetry::TraceContext::from_w3c(
+                "00-11111111111111111111111111111111-2222222222222222-01",
+                None,
+            )
+            .unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            for version in [2, 2, 1] {
+                let mut request = encode_request(42, &req).unwrap();
+                if version == 2 {
+                    talon_transport::envelope::encode(&mut request, Some(&parent), None).unwrap();
+                }
+                client.write_all(request).await.0.unwrap();
+                let (header, body) = read_response(&mut client).await;
+                assert_eq!(header.version, version);
+                assert_eq!(header.request_id, 42);
+                assert!(!header.flags.contains(Flags::ERROR));
+                assert_eq!(body, (3..11).collect::<Vec<u8>>());
+            }
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// A paged build for cross-page wire tests.

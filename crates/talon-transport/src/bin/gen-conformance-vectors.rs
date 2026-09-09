@@ -49,7 +49,7 @@ fn object(bucket: &str, path: &str) -> ObjectId {
 }
 
 fn vectors() -> Vec<Vector> {
-    vec![
+    let mut result = vec![
         // --- Frame header on its own ---------------------------------------
         Vector {
             name: "frame_header.get_range",
@@ -233,7 +233,39 @@ fn vectors() -> Vec<Vector> {
             note: "ERROR flag set; the body is a UTF-8 message, not a payload",
             bytes: data::encode_error(9, "worker is not ready"),
         },
-    ]
+    ];
+    let parent = talon_telemetry::TraceContext::from_w3c(
+        "00-11111111111111111111111111111111-2222222222222222-01",
+        Some("vendor=value"),
+    )
+    .unwrap();
+    let original = result
+        .iter()
+        .find(|v| v.name == "data.range_request")
+        .unwrap()
+        .bytes
+        .clone();
+    for (name, context) in [
+        ("v2.range.context", Some(&parent)),
+        ("v2.range.empty", None),
+    ] {
+        let mut bytes = original.clone();
+        talon_transport::envelope::encode(&mut bytes, context, None).unwrap();
+        result.push(Vector {
+            name,
+            note: "v2 envelope; original v1 business payload unchanged",
+            bytes,
+        });
+    }
+    result.push(Vector {
+        name: "v2.response.raw",
+        note: "v2 response has no metadata prefix",
+        bytes: talon_transport::envelope::response_version(
+            data::response_header_ok(9, 4096).to_vec(),
+            2,
+        ),
+    });
+    result
 }
 
 fn main() -> anyhow::Result<()> {

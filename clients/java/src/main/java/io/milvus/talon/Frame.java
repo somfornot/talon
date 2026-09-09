@@ -59,12 +59,18 @@ public final class Frame {
         }
     }
 
+    private final int version;
     private final MsgType type;
     private final int flags;
     private final int requestId;
     private final int length;
 
     public Frame(MsgType type, int flags, int requestId, int length) {
+        this(1, type, flags, requestId, length);
+    }
+
+    private Frame(int version, MsgType type, int flags, int requestId, int length) {
+        this.version = version;
         this.type = type;
         this.flags = flags;
         this.requestId = requestId;
@@ -91,7 +97,7 @@ public final class Frame {
     public byte[] encode() {
         ByteBuffer b = ByteBuffer.allocate(HEADER_LEN).order(ByteOrder.BIG_ENDIAN);
         b.putShort((short) MAGIC);
-        b.put((byte) PROTOCOL_VERSION);
+        b.put((byte) version);
         b.put((byte) type.value);
         b.putShort((short) flags);
         b.putShort((short) 0); // reserved
@@ -119,7 +125,7 @@ public final class Frame {
                             magic, MAGIC));
         }
         int version = b.get() & 0xFF;
-        if (version != PROTOCOL_VERSION) {
+        if (version != 1 && version != 2) {
             throw new ProtocolException(
                     "unsupported protocol version " + version + "; this client speaks "
                             + PROTOCOL_VERSION);
@@ -132,6 +138,6 @@ public final class Frame {
         if (length < 0) {
             throw new ProtocolException("payload length exceeds 2^31: " + (length & 0xFFFFFFFFL));
         }
-        return new Frame(type, flags, requestId, length);
+        return new Frame(version, type, flags, requestId, length);
     }
 }

@@ -35,6 +35,34 @@ public final class ConformanceTest {
         Map<String, byte[]> byName = parseVectors(Files.readString(vectors));
         System.out.println("loaded " + byName.size() + " vectors from " + vectors);
 
+        check("v2 carrier envelope matches Rust", () -> {
+            TraceContext parent = TraceContext.fromW3c("00-11111111111111111111111111111111-2222222222222222-01", "vendor=value");
+            assertBytes(byName.get("v2.range.context"), Telemetry.envelope(byName.get("data.range_request"), parent, null));
+            assertBytes(byName.get("v2.response.raw"), Frame.decode(byName.get("v2.response.raw")).encode());
+            assertTrue(TraceContext.fromW3c("invalid", null) == null, "invalid parent");
+        });
+        check("context override, nesting and capability policy", () -> {
+            TraceContext a = TraceContext.fromW3c("00-11111111111111111111111111111111-1111111111111111-00", null);
+            TraceContext b = TraceContext.fromW3c("00-22222222222222222222222222222222-2222222222222222-00", null);
+            byte[] frame = byName.get("data.range_request");
+            Telemetry.configure(java.util.Set.of("worker"), () -> a);
+            Telemetry.call(RequestOptions.INHERIT, () -> {
+                assertBytes(Telemetry.envelope(frame, a, null), Telemetry.envelope(frame, "worker"));
+                Telemetry.call(RequestOptions.explicit(b), () -> {
+                    assertBytes(Telemetry.envelope(frame, b, null), Telemetry.envelope(frame, "worker"));
+                    return null;
+                });
+                Telemetry.call(RequestOptions.ROOT, () -> {
+                    assertBytes(frame, Telemetry.envelope(frame, "worker"));
+                    return null;
+                });
+                assertBytes(Telemetry.envelope(frame, a, null), Telemetry.envelope(frame, "worker"));
+                assertBytes(frame, Telemetry.envelope(frame, "old-worker"));
+                return null;
+            });
+            assertBytes(frame, Telemetry.envelope(frame, "worker"));
+            Telemetry.configure(java.util.Set.of(), null);
+        });
         frameHeaderDecodes(byName);
         frameHeaderEncodesIdentically(byName);
         zeroLengthPayloadIsNotEof(byName);
@@ -240,7 +268,7 @@ public final class ConformanceTest {
     }
 
     private interface Check {
-        void run();
+        void run() throws Exception;
     }
 
     private static void check(String name, Check c) {

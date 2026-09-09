@@ -109,7 +109,11 @@ where
     // Decode the header (validates magic/version/type and the global max), then
     // enforce the per-type cap BEFORE allocating the payload.
     let header = FrameHeader::decode(&header_buf)?;
-    let cap = max_payload_for(header.msg_type);
+    let cap = max_payload_for(header.msg_type).saturating_add(if header.version == 2 {
+        crate::envelope::ENVELOPE_OVERHEAD
+    } else {
+        0
+    });
     if header.length > cap {
         return Err(ReadFrameError::PayloadTooLarge {
             msg_type: header.msg_type,
@@ -174,6 +178,7 @@ mod tests {
 
     fn frame_bytes(msg_type: MsgType, length_override: Option<u32>, payload: &[u8]) -> Vec<u8> {
         let header = FrameHeader {
+            version: 1,
             msg_type,
             flags: Flags::default(),
             request_id: 1,
@@ -200,6 +205,7 @@ mod tests {
         // reader that tried to allocate+read the payload would instead time out
         // or hang; the cap check fires first on the header alone.
         let header = FrameHeader {
+            version: 1,
             msg_type: MsgType::Control,
             flags: Flags::default(),
             request_id: 1,
