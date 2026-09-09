@@ -11,8 +11,8 @@
 //! is done by the caller with the returned unit list. Segmented-LRU / TinyLFU
 //! are deferred per DESIGN.md.
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use talon_core::{BlockId, PageIndex};
 
@@ -23,6 +23,13 @@ pub enum CacheUnit {
     Whole(BlockId),
     /// One page of a paged block.
     Page(BlockId, PageIndex),
+}
+
+/// A policy snapshot; a touch, replacement, or new pin invalidates deletion.
+#[derive(Clone, Debug)]
+pub(crate) struct EvictionCandidate {
+    pub unit: CacheUnit,
+    revision: u64,
 }
 
 /// Internal per-unit bookkeeping.
@@ -37,6 +44,17 @@ struct Entry {
 /// A byte-accounted LRU tracker with reader pinning.
 pub struct Lru {
     inner: Mutex<Inner>,
+}
+
+/// A cancellation-safe capacity-policy pin.
+pub struct LruPin {
+    lru: Arc<Lru>,
+    unit: CacheUnit,
+}
+impl Drop for LruPin {
+    fn drop(&mut self) {
+        self.lru.unpin(&self.unit);
+    }
 }
 
 struct Inner {
@@ -133,6 +151,13 @@ impl Lru {
         }
     }
 
+    pub fn pin_guard(self: &Arc<Self>, unit: CacheUnit) -> Option<LruPin> {
+        self.pin(&unit).then(|| LruPin {
+            lru: self.clone(),
+            unit,
+        })
+    }
+
     /// Release one pin previously taken with [`pin`](Self::pin).
     pub fn unpin(&self, unit: &CacheUnit) {
         let mut g = self.inner.lock().unwrap();
@@ -147,6 +172,91 @@ impl Lru {
         let e = g.entries.remove(unit)?;
         Self::subtract_bytes(&mut g.total_bytes, e.bytes);
         Some(e.bytes)
+    }
+
+    /// Snapshot candidates without charging freed bytes before unlink succeeds.
+    pub(crate) fn candidates_to_fit(
+        &self,
+        capacity: u64,
+        excluded: &HashSet<CacheUnit>,
+    ) -> Vec<EvictionCandidate> {
+        let g = self.inner.lock().unwrap();
+        if g.total_bytes <= capacity {
+            return Vec::new();
+        }
+        let mut projected = g.total_bytes;
+        let mut selected = HashSet::new();
+        let mut out = Vec::new();
+        while projected > capacity {
+            let victim = g
+                .entries
+                .iter()
+                .filter(|(unit, e)| {
+                    e.pins == 0 && !selected.contains(*unit) && !excluded.contains(*unit)
+                })
+                .min_by_key(|(_, e)| e.last_used);
+            let Some((unit, entry)) = victim else {
+                break;
+            };
+            projected = projected.saturating_sub(entry.bytes);
+            selected.insert(unit.clone());
+            out.push(EvictionCandidate {
+                unit: unit.clone(),
+                revision: entry.last_used,
+            });
+        }
+        out
+    }
+
+    /// Old-version candidates; removal is committed by the caller after I/O.
+    pub(crate) fn superseded_candidates(&self, keep: &BlockId) -> Vec<EvictionCandidate> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|(unit, e)| {
+                let id = match unit {
+                    CacheUnit::Whole(id) | CacheUnit::Page(id, _) => id,
+                };
+                e.pins == 0
+                    && id.object == keep.object
+                    && id.offset == keep.offset
+                    && id.block_size == keep.block_size
+                    && id.version != keep.version
+            })
+            .map(|(unit, entry)| EvictionCandidate {
+                unit: unit.clone(),
+                revision: entry.last_used,
+            })
+            .collect()
+    }
+
+    /// Snapshot resident units for an explicit block invalidation.
+    pub(crate) fn block_candidates(&self, block: &BlockId) -> Vec<EvictionCandidate> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|(unit, _)| match unit {
+                CacheUnit::Whole(id) | CacheUnit::Page(id, _) => id == block,
+            })
+            .map(|(unit, entry)| EvictionCandidate {
+                unit: unit.clone(),
+                revision: entry.last_used,
+            })
+            .collect()
+    }
+
+    /// Recheck with the block mutation gate held. Commits also pin under that gate.
+    pub(crate) fn candidate_is_current(&self, candidate: &EvictionCandidate) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .get(&candidate.unit)
+            .is_some_and(|entry| entry.pins == 0 && entry.last_used == candidate.revision)
     }
 
     /// Evict and return every *superseded* unit — whole block or page — for the
