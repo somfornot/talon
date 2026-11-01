@@ -4,6 +4,7 @@
 //! namespace metadata log and snapshots. Only committed seals are recovered.
 //! Relocation commits are durable before old payload files are unlinked.
 mod access;
+pub(crate) use access::DirtyAccess;
 mod disk_io;
 mod format;
 mod journal;
